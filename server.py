@@ -24,11 +24,26 @@ WATCH_PAGE = """<!DOCTYPE html>
 <style>
   html, body {{ margin: 0; padding: 0; height: 100%; background: #000; overflow: hidden; }}
   iframe {{ position: fixed; inset: 0; width: 100vw; height: 100vh; border: 0; }}
+  #loading {{
+    position: fixed; top: 12px; left: 50%; transform: translateX(-50%);
+    background: rgba(20,20,20,.85); color: #eee; z-index: 10;
+    padding: 6px 14px; border-radius: 20px; font: 14px/1.6 sans-serif;
+  }}
+  #fallback {{
+    position: fixed; bottom: 8px; left: 50%; transform: translateX(-50%);
+    z-index: 10; font: 12px/1.6 sans-serif;
+  }}
+  #fallback a {{ color: #8ab4f8; text-decoration: none; }}
 </style>
 </head>
 <body>
+<div id="loading">جاري تحميل المشغل... ⏳</div>
 <iframe src="{src}" allowfullscreen scrolling="no"
-        allow="autoplay; fullscreen; encrypted-media; picture-in-picture"></iframe>
+        referrerpolicy="no-referrer"
+        sandbox="allow-scripts allow-same-origin allow-presentation allow-forms"
+        allow="autoplay; fullscreen; encrypted-media; picture-in-picture"
+        onload="document.getElementById('loading').style.display='none'"></iframe>
+<div id="fallback"><a href="{src}" target="_blank" rel="noopener">فتح في تاب جديد ↗</a></div>
 </body>
 </html>"""
 

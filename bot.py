@@ -7,11 +7,11 @@ loop (SPEC §6/§7). All bot UI texts are Arabic; code/comments in English.
 import asyncio
 import collections
 import contextlib
-import io
 import logging
 import os
 import re
 import sys
+import tempfile
 import time
 import uuid
 
@@ -47,6 +47,14 @@ BASE_PUBLIC_URL = os.environ.get("BASE_PUBLIC_URL", "").strip().rstrip("/")
 PORT = int(os.environ.get("PORT", "8080"))
 WATCH_SECRET = os.environ.get("WATCH_SECRET", "").strip() or BOT_TOKEN
 
+# Optional local Bot API server (telegram-bot-api --local, see Dockerfile):
+# when TG_API_ID/TG_API_HASH (from my.telegram.org) are set, the container
+# starts a local Bot API on :8081 and the bot talks to it -> 2GB file limit.
+TG_API_ID = os.environ.get("TG_API_ID", "").strip()
+TG_API_HASH = os.environ.get("TG_API_HASH", "").strip()
+LOCAL_BOT_API = bool(TG_API_ID and TG_API_HASH)
+LOCAL_API_URL = "http://localhost:8081"
+
 # ---------------------------------------------------------------------------
 # In-memory caches (bounded, FIFO eviction)
 # ---------------------------------------------------------------------------
@@ -81,13 +89,18 @@ def get_url(token: str) -> str | None:
 ERR_FETCH = "حدث خطأ أثناء الجلب، حاول مرة أخرى 🙏"
 ERR_EXPIRED = "انتهت صلاحية هذه الأزرار، ابحث من جديد 🔍"
 MSG_PREPARING = "جاري تجهيز الفيديو... ⏳"
-MSG_RESOLVE_FAIL = "تعذّر الاستخراج المباشر — استخدم المشاهدة أو التحميل 🎬⬇️"
+MSG_SENDING = "📤 جاري إرسال الفيديو إلى تليجرام..."
+MSG_RESOLVE_FAIL = "تعذّر تجهيز الفيديو من هذا المصدر — جرّب جودة أخرى أو استخدم المشاهدة/التحميل 🎬⬇️"
 
 RESULTS_PER_PAGE = 10
 EPS_PER_PAGE = 20
-MAX_VIDEO_BYTES = 45 * 1024 * 1024  # 45MB safety margin (Bot API limit: 50MB)
-VIDEO_TOTAL_TIMEOUT = 120  # seconds
-# Limit concurrent in-memory video downloads (each may hold up to 45MB).
+if LOCAL_BOT_API:
+    MAX_VIDEO_BYTES = 1990 * 1024 * 1024  # ~2GB (local Bot API limit)
+    VIDEO_TOTAL_TIMEOUT = 3600  # seconds — 2GB downloads need time
+else:
+    MAX_VIDEO_BYTES = 45 * 1024 * 1024  # 45MB safety margin (cloud Bot API limit: 50MB)
+    VIDEO_TOTAL_TIMEOUT = 600  # seconds
+# Limit concurrent video downloads (each writes to a temp file in /tmp).
 VIDEO_SEND_SEM = asyncio.Semaphore(2)
 
 
@@ -233,11 +246,22 @@ def episode_panel_text(ep: dict) -> str:
     )
 
 
-def servers_keyboard(ep: dict, tok: str) -> InlineKeyboardMarkup:
+def servers_keyboard(entries: list[tuple[str, str]], tok: str) -> InlineKeyboardMarkup:
+    """entries: [(button label, embed_url)] — each opens our /watch page."""
     rows = []
-    for s in ep["servers"]:
-        url = make_watch_url(BASE_PUBLIC_URL, s["embed_url"], WATCH_SECRET)
-        rows.append([InlineKeyboardButton(f"▶️ {s['name']}", url=url)])
+    for label, embed_url in entries:
+        url = make_watch_url(BASE_PUBLIC_URL, embed_url, WATCH_SECRET)
+        rows.append([InlineKeyboardButton(f"▶️ {label}", url=url)])
+    rows.append([InlineKeyboardButton("🔙 رجوع", callback_data=f"panel|{tok}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def video_qualities_keyboard(options: list[dict], tok: str) -> InlineKeyboardMarkup:
+    """options: [{"label", "kind", "url"}] — each starts the video-send flow."""
+    rows = []
+    for opt in options:
+        qtok = put_url(f"{tok}|{opt['kind']}|{opt['url']}")
+        rows.append([InlineKeyboardButton(f"📤 {opt['label']}", callback_data=f"vq|{qtok}")])
     rows.append([InlineKeyboardButton("🔙 رجوع", callback_data=f"panel|{tok}")])
     return InlineKeyboardMarkup(rows)
 
@@ -386,6 +410,46 @@ async def open_episode(query_obj, ep_url: str) -> None:
     )
 
 
+async def _watch_entries(ep: dict) -> list[tuple[str, str]]:
+    """(label, embed_url) pairs for the watch menu. yonaplay servers are
+    expanded into their inner players (e.g. 'Google Drive - HD'); every other
+    server stays a single button."""
+    entries = []
+    for s in ep["servers"]:
+        if "yonaplay" in s["name"].lower():
+            players = await asyncio.to_thread(scraper.get_yonaplay_players, s["embed_url"])
+            if players:
+                for p in players:
+                    entries.append((f"{p['host']} - {p['quality']}", p["url"]))
+                continue
+        entries.append((s["name"], s["embed_url"]))
+    return entries
+
+
+async def _video_options(ep: dict) -> list[dict]:
+    """Quality choices for 'send video here': Google Drive links (HD/FHD)
+    extracted from yonaplay players + ok.ru (best quality on resolve)."""
+    options = []
+    for s in ep["servers"]:
+        name = s["name"].lower()
+        if "yonaplay" in name:
+            players = await asyncio.to_thread(scraper.get_yonaplay_players, s["embed_url"])
+            for p in players:
+                if "drive.google" in p["url"]:
+                    options.append(
+                        {
+                            "label": f"Google Drive - {p['quality']}",
+                            "kind": "drive",
+                            "url": p["url"],
+                        }
+                    )
+        elif "ok.ru" in name or "odnoklassniki" in name or "ok.ru" in s["embed_url"]:
+            options.append(
+                {"label": f"{s['name']} - أفضل جودة", "kind": "okru", "url": s["embed_url"]}
+            )
+    return options
+
+
 async def show_servers(query_obj, tok: str) -> None:
     ep_url = get_url(tok)
     if not ep_url:
@@ -400,10 +464,11 @@ async def show_servers(query_obj, tok: str) -> None:
     if not ep["servers"]:
         await query_obj.answer("لا توجد سيرفرات مشاهدة متاحة لهذه الحلقة 😕", show_alert=True)
         return
+    entries = await _watch_entries(ep)
     await query_obj.edit_message_text(
         f"🎬 سيرفرات المشاهدة — {ep['anime_title']} الحلقة {ep['number']}\n"
         "اختر سيرفرًا (يفتح صفحة المشاهدة):",
-        reply_markup=servers_keyboard(ep, tok),
+        reply_markup=servers_keyboard(entries, tok),
     )
 
 
@@ -444,8 +509,44 @@ async def show_panel(query_obj, tok: str) -> None:
     )
 
 
-async def send_video_flow(query_obj, tok: str) -> None:
-    """Best-effort direct video sending (SPEC §8)."""
+async def show_video_qualities(query_obj, tok: str) -> None:
+    """'📤 إرسال الفيديو هنا' -> quality menu (Google Drive HD/FHD + ok.ru)."""
+    ep_url = get_url(tok)
+    if not ep_url:
+        await query_obj.answer(ERR_EXPIRED, show_alert=True)
+        return
+    try:
+        ep = await fetch_episode(ep_url)
+    except scraper.ScraperError:
+        log.exception("episode fetch failed: %s", ep_url)
+        await query_obj.answer(ERR_FETCH, show_alert=True)
+        return
+    options = await _video_options(ep)
+    if not options:
+        await query_obj.answer(
+            "لا توجد مصادر إرسال مباشر متاحة لهذه الحلقة 😕 استخدم المشاهدة أو التحميل",
+            show_alert=True,
+        )
+        return
+    limit = "2 جيجا" if LOCAL_BOT_API else "45 ميجا"
+    await query_obj.edit_message_text(
+        f"📤 إرسال الفيديو — {ep['anime_title']} الحلقة {ep['number']}\n"
+        f"اختر الجودة (الحد الأقصى للإرسال: {limit}):",
+        reply_markup=video_qualities_keyboard(options, tok),
+    )
+
+
+async def start_video_send(query_obj, qtok: str) -> None:
+    """Quality button pressed -> resolve + download + send (best-effort)."""
+    payload = get_url(qtok)
+    if not payload:
+        await query_obj.answer(ERR_EXPIRED, show_alert=True)
+        return
+    try:
+        tok, kind, source_url = payload.split("|", 2)
+    except ValueError:
+        await query_obj.answer(ERR_EXPIRED, show_alert=True)
+        return
     ep_url = get_url(tok)
     if not ep_url:
         await query_obj.answer(ERR_EXPIRED, show_alert=True)
@@ -457,7 +558,8 @@ async def send_video_flow(query_obj, tok: str) -> None:
         # تجهيز الفيديو..." progress message is already shown.
         async with VIDEO_SEND_SEM:
             await asyncio.wait_for(
-                _send_video_inner(query_obj, chat_id, ep_url), timeout=VIDEO_TOTAL_TIMEOUT
+                _send_video_inner(query_obj, progress, chat_id, ep_url, kind, source_url),
+                timeout=VIDEO_TOTAL_TIMEOUT,
             )
     except asyncio.TimeoutError:
         log.warning("video flow timed out for %s", ep_url)
@@ -472,67 +574,120 @@ async def send_video_flow(query_obj, tok: str) -> None:
             await progress.delete()
 
 
-async def _send_video_inner(query_obj, chat_id: int, ep_url: str) -> None:
+def _download_to_temp(mp4_url: str, path: str, state: dict) -> int:
+    """Stream mp4_url into `path`. Returns bytes written; raises TooBigError
+    (carrying the known size) when the file exceeds MAX_VIDEO_BYTES.
+    `state["done"]`/`state["total"]` are updated for progress reporting."""
+    with requests.get(
+        mp4_url,
+        stream=True,
+        timeout=60,
+        headers={"User-Agent": resolvers.MOBILE_UA},
+    ) as r:
+        r.raise_for_status()
+        total = int(r.headers.get("Content-Length") or 0)
+        state["total"] = total
+        if total > MAX_VIDEO_BYTES:
+            raise TooBigError(total)
+        written = 0
+        with open(path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                f.write(chunk)
+                written += len(chunk)
+                state["done"] = written
+                if written > MAX_VIDEO_BYTES:
+                    raise TooBigError(written)
+    return written
+
+
+class TooBigError(Exception):
+    def __init__(self, size: int):
+        super().__init__(f"video too big: {size} bytes")
+        self.size = size
+
+
+async def _progress_updater(progress, state: dict) -> None:
+    """Edit the progress message every ~5s with the downloaded MB."""
+    while True:
+        await asyncio.sleep(5)
+        mb = state["done"] / (1024 * 1024)
+        total = state.get("total") or 0
+        text = f"{MSG_PREPARING}\n⬇️ تم تنزيل {mb:.0f} ميجا"
+        if total:
+            text += f" من {total / (1024 * 1024):.0f}"
+        with contextlib.suppress(Exception):
+            await progress.edit_text(text)
+
+
+async def _send_video_inner(query_obj, progress, chat_id: int, ep_url: str,
+                            kind: str, source_url: str) -> None:
     ep = await fetch_episode(ep_url)
 
-    mp4_url = None
-    used_server = None
-    for s in ep["servers"]:
-        resolved = await asyncio.to_thread(resolvers.resolve_mp4, s["embed_url"])
-        if resolved:
-            mp4_url = resolved
-            used_server = s
-            break
+    if kind == "drive":
+        mp4_url = await asyncio.to_thread(resolvers.resolve_drive_mp4, source_url)
+    else:  # okru
+        mp4_url = await asyncio.to_thread(resolvers.resolve_mp4, source_url)
     if not mp4_url:
         await query_obj.message.reply_text(MSG_RESOLVE_FAIL)
         return
 
-    # Probe the size (streamed GET, abort early if too large)
-    def probe_and_download():
-        with requests.get(
-            mp4_url,
-            stream=True,
-            timeout=30,
-            headers={"User-Agent": resolvers.MOBILE_UA},
-        ) as r:
-            r.raise_for_status()
-            length = r.headers.get("Content-Length")
-            if length and int(length) > MAX_VIDEO_BYTES:
-                return None, int(length)  # too big -> don't download
-            buf = io.BytesIO()
-            for chunk in r.iter_content(chunk_size=512 * 1024):
-                buf.write(chunk)
-                if buf.tell() > MAX_VIDEO_BYTES:
-                    return None, buf.tell()
-            return buf.getvalue(), buf.tell()
+    tmp = tempfile.NamedTemporaryFile(prefix="witanime-", suffix=".mp4", delete=False)
+    tmp_path = tmp.name
+    tmp.close()
+    state = {"done": 0, "total": 0}
+    updater = asyncio.create_task(_progress_updater(progress, state))
+    try:
+        try:
+            await asyncio.to_thread(_download_to_temp, mp4_url, tmp_path, state)
+        except TooBigError as exc:
+            await _reply_too_big(query_obj, ep, source_url, exc.size)
+            return
+        except requests.RequestException:
+            log.exception("download failed: %s", mp4_url)
+            await query_obj.message.reply_text(MSG_RESOLVE_FAIL)
+            return
+    finally:
+        updater.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await updater
 
-    data, size = await asyncio.to_thread(probe_and_download)
-    if data is None:
-        mb = size / (1024 * 1024) if size else 0
-        rows = []
-        if used_server:
-            watch = make_watch_url(BASE_PUBLIC_URL, used_server["embed_url"], WATCH_SECRET)
-            rows.append([InlineKeyboardButton(f"🎬 مشاهدة ({used_server['name']})", url=watch)])
-        dl_rows = downloads_keyboard(ep, None).inline_keyboard
-        rows.extend(dl_rows)
-        await query_obj.message.reply_text(
-            f"حجم الفيديو كبير ({mb:.0f} ميجا) ولا يمكن إرساله هنا 😅\n"
-            "يمكنك المشاهدة مباشرة أو التحميل من الروابط:",
-            reply_markup=InlineKeyboardMarkup(rows),
-        )
-        return
+    with contextlib.suppress(Exception):
+        await progress.edit_text(MSG_SENDING)
+    try:
+        caption = f"🎬 {ep['anime_title']} — الحلقة {ep['number']}"
+        with open(tmp_path, "rb") as video_file:
+            await query_obj.bot.send_video(
+                chat_id=chat_id,
+                video=video_file,
+                filename=f"episode-{ep['number']}.mp4",
+                caption=caption,
+                supports_streaming=True,
+                read_timeout=VIDEO_TOTAL_TIMEOUT,
+                write_timeout=VIDEO_TOTAL_TIMEOUT,
+                connect_timeout=30,
+            )
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path)
 
-    caption = f"🎬 {ep['anime_title']} — الحلقة {ep['number']}"
-    await query_obj.bot.send_video(
-        chat_id=chat_id,
-        video=data,
-        filename=f"episode-{ep['number']}.mp4",
-        caption=caption,
-        supports_streaming=True,
-        read_timeout=VIDEO_TOTAL_TIMEOUT,
-        write_timeout=VIDEO_TOTAL_TIMEOUT,
-        connect_timeout=30,
+
+async def _reply_too_big(query_obj, ep: dict, embed_url: str, size: int) -> None:
+    mb = size / (1024 * 1024) if size else 0
+    rows = []
+    watch = make_watch_url(BASE_PUBLIC_URL, embed_url, WATCH_SECRET)
+    rows.append([InlineKeyboardButton("🎬 مشاهدة مباشرة", url=watch)])
+    dl_rows = downloads_keyboard(ep, None).inline_keyboard
+    rows.extend(dl_rows)
+    text = (
+        f"حجم الفيديو كبير ({mb:.0f} ميجا) ولا يمكن إرساله هنا 😅\n"
+        "يمكنك المشاهدة مباشرة أو التحميل من الروابط:"
     )
+    if not LOCAL_BOT_API:
+        text += (
+            "\n\n💡 ملاحظة: حد تليجرام للبوتات 50 ميجا. يمكن رفعه إلى 2 جيجا "
+            "بتفعيل TG_API_ID و TG_API_HASH (سيرفر Bot API محلي)."
+        )
+    await query_obj.message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -587,7 +742,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await show_downloads(q, parts[1])
         elif kind == "vid":
             await q.answer()
-            await send_video_flow(q, parts[1])
+            await show_video_qualities(q, parts[1])
+        elif kind == "vq":  # video quality chosen -> start the send flow
+            await q.answer()
+            await start_video_send(q, parts[1])
         else:
             await q.answer()
     except Exception:
@@ -639,7 +797,14 @@ def main() -> None:
     if not BASE_PUBLIC_URL:
         sys.exit("BASE_PUBLIC_URL is required (your public Railway domain)")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    builder = Application.builder().token(BOT_TOKEN)
+    if LOCAL_BOT_API:
+        # Talk to the local telegram-bot-api started by the Docker CMD.
+        builder = builder.base_url(f"{LOCAL_API_URL}/bot").base_file_url(
+            f"{LOCAL_API_URL}/file/bot"
+        )
+        log.info("using local Bot API at %s (2GB send limit)", LOCAL_API_URL)
+    app = builder.build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(CallbackQueryHandler(on_callback))

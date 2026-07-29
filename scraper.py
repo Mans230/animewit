@@ -189,6 +189,63 @@ def _decode_download_urls(html: str) -> list[str]:
     return urls
 
 
+# Friendly labels for known yonaplay player hosts (matched against the span text)
+_YONAPLAY_HOST_LABELS = (
+    ("drive.google", "Google Drive"),
+    ("mega.nz", "Mega"),
+    ("4shared", "4shared"),
+)
+
+
+def get_yonaplay_players(embed_url: str) -> list[dict]:
+    """Fetch a yonaplay embed page (Referer: witanime.life is required, it 404s
+    otherwise) and extract the alternative player links hidden inside
+    `onclick="go_to_player('<base64>')"` of div.OD_SUB (HD) / div.OD_SUB2 (FHD).
+
+    -> [{"host": "Google Drive"|"Mega"|"4shared"|span text,
+         "quality": "HD"|"FHD", "url": str}]
+    Returns [] on any failure.
+    """
+    try:
+        resp = requests.get(
+            embed_url,
+            headers={**HEADERS, "Referer": BASE + "/"},
+            timeout=TIMEOUT,
+        )
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        log.warning("yonaplay fetch failed (%s): %s", embed_url, exc)
+        return []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    players = []
+    for selector, quality in (("div.OD_SUB", "HD"), ("div.OD_SUB2", "FHD")):
+        div = soup.select_one(selector)
+        if not div:
+            continue
+        for li in div.select("li"):
+            m = re.search(r"go_to_player\('([^']+)'\)", li.get("onclick") or "")
+            if not m:
+                continue
+            try:
+                b64 = m.group(1)
+                url = base64.b64decode(b64 + "=" * (-len(b64) % 4)).decode()
+            except Exception as exc:
+                log.warning("yonaplay player decode failed: %s", exc)
+                continue
+            if not url.startswith(("http://", "https://")):
+                continue
+            span = li.select_one("span")
+            raw_host = span.get_text(strip=True) if span else ""
+            host = raw_host
+            for needle, label in _YONAPLAY_HOST_LABELS:
+                if needle in raw_host.lower():
+                    host = label
+                    break
+            players.append({"host": host, "quality": quality, "url": url})
+    return players
+
+
 def get_episode(ep_url: str) -> dict:
     """-> {"title", "anime_title", "anime_url", "number",
           "prev_url": str|None, "next_url": str|None,

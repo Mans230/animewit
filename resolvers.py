@@ -1,9 +1,11 @@
 """Direct mp4 resolvers for third-party embeds (best-effort, SPEC §8).
 
-Currently supported: ok.ru
-    GET https://ok.ru/videoembed/{id} with a mobile User-Agent, extract the
-    JSON inside `data-options` (or `flashvars.metadata`), pick the highest
-    quality mp4 from the videos list.
+Supported:
+- ok.ru: GET https://ok.ru/videoembed/{id} with a mobile User-Agent, extract
+  the JSON inside `data-options` (or `flashvars.metadata`), pick the highest
+  quality mp4 from the videos list.
+- Google Drive: turn a `/file/d/{ID}/preview` link into the direct download
+  stream at drive.usercontent.google.com and verify it serves video bytes.
 """
 
 import html as html_module
@@ -76,12 +78,60 @@ def _resolve_okru(embed_url: str) -> str | None:
     return url or None
 
 
+def _looks_like_video(headers) -> bool:
+    """content-type is video/* or the resource is big enough to be a video."""
+    ctype = (headers.get("Content-Type") or "").lower()
+    if "video" in ctype or "octet-stream" in ctype:
+        return True
+    try:
+        return int(headers.get("Content-Length") or 0) > 1024 * 1024
+    except ValueError:
+        return False
+
+
+def resolve_drive_mp4(preview_url: str) -> str | None:
+    """Turn a Google Drive `/file/d/{ID}/preview` URL into a direct mp4
+    download URL and verify (HEAD, ranged GET fallback) that it serves video.
+    Returns the direct URL or None on any failure."""
+    m = re.search(r"/file/d/([A-Za-z0-9_-]+)", preview_url)
+    if not m:
+        return None
+    file_id = m.group(1)
+    direct = (
+        "https://drive.usercontent.google.com/download"
+        f"?id={file_id}&export=download&confirm=t"
+    )
+    headers = {"User-Agent": MOBILE_UA}
+    try:
+        resp = requests.head(direct, headers=headers, timeout=TIMEOUT, allow_redirects=True)
+        if resp.ok and _looks_like_video(resp.headers):
+            return direct
+    except requests.RequestException as exc:
+        log.warning("drive HEAD probe failed: %s", exc)
+    # Fallback: some endpoints reject HEAD -> probe with a 1-byte ranged GET
+    try:
+        with requests.get(
+            direct,
+            headers={**headers, "Range": "bytes=0-0"},
+            timeout=TIMEOUT,
+            stream=True,
+            allow_redirects=True,
+        ) as resp:
+            if resp.ok and _looks_like_video(resp.headers):
+                return direct
+    except requests.RequestException as exc:
+        log.warning("drive range probe failed: %s", exc)
+    return None
+
+
 def resolve_mp4(embed_url: str) -> str | None:
     """Resolve an embed URL to a direct mp4 URL. Returns None if unsupported
     or on any failure (best-effort)."""
     try:
         if "ok.ru" in embed_url or "odnoklassniki" in embed_url:
             return _resolve_okru(embed_url)
+        if "drive.google.com" in embed_url:
+            return resolve_drive_mp4(embed_url)
         return None
     except Exception as exc:
         log.warning("resolve_mp4(%s) failed: %s", embed_url, exc)
