@@ -151,6 +151,7 @@ def _decode_watch_servers(html: str) -> list[str]:
             urls.append(decode_server(i))
         except Exception as exc:
             log.warning("server %d decode failed: %s", i, exc)
+            urls.append("")  # placeholder — keeps names/urls index alignment
     return urls
 
 
@@ -210,7 +211,7 @@ def get_yonaplay_players(embed_url: str) -> list[dict]:
         resp = requests.get(
             embed_url,
             headers={**HEADERS, "Referer": BASE + "/"},
-            timeout=TIMEOUT,
+            timeout=10,  # short on purpose — menus must never hang 30s per server
         )
         resp.raise_for_status()
     except requests.RequestException as exc:
@@ -278,6 +279,9 @@ def get_episode(ep_url: str) -> dict:
     server_urls = _decode_watch_servers(html)
     servers = []
     for name, embed in zip(server_names, server_urls):
+        if not embed.startswith(("http://", "https://")):
+            log.warning("skipping server %r — empty/invalid embed after decode", name)
+            continue  # prevents broken /watch?u= (Bad Request) buttons
         if "yonaplay" in name.lower():
             embed += "&apiKey=" + YONAPLAY_API_KEY
         servers.append({"name": name, "embed_url": embed})

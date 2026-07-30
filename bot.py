@@ -422,32 +422,104 @@ async def open_episode(query_obj, ep_url: str) -> None:
     )
 
 
+# --- yonaplay players cache (avoids re-fetching on every menu open) ----------
+_YONAPLAY_CACHE: collections.OrderedDict[str, tuple[float, list[dict]]] = collections.OrderedDict()
+_YONAPLAY_CACHE_TTL = 6 * 3600  # seconds
+_YONAPLAY_CACHE_MAX = 500
+
+
+async def _yonaplay_players_cached(embed_url: str) -> list[dict]:
+    """get_yonaplay_players with a small TTL cache (thread-safe enough for our
+    single-loop usage)."""
+    now = time.time()
+    entry = _YONAPLAY_CACHE.get(embed_url)
+    if entry and now - entry[0] < _YONAPLAY_CACHE_TTL:
+        _YONAPLAY_CACHE.move_to_end(embed_url)
+        return entry[1]
+    players = await asyncio.to_thread(scraper.get_yonaplay_players, embed_url)
+    _YONAPLAY_CACHE[embed_url] = (now, players)
+    _YONAPLAY_CACHE.move_to_end(embed_url)
+    while len(_YONAPLAY_CACHE) > _YONAPLAY_CACHE_MAX:
+        _YONAPLAY_CACHE.popitem(last=False)
+    return players
+
+
+async def _expand_yonaplay_all(servers: list[dict]) -> dict[str, list[dict]]:
+    """Fetch yonaplay players for ALL yonaplay servers in parallel (never
+    sequentially — a slow/blocked host must not freeze the menu)."""
+    yona = [s for s in servers if "yonaplay" in s["name"].lower()]
+    if not yona:
+        return {}
+    results = await asyncio.gather(
+        *(_yonaplay_players_cached(s["embed_url"]) for s in yona),
+        return_exceptions=True,
+    )
+    out = {}
+    for s, r in zip(yona, results):
+        out[s["embed_url"]] = r if isinstance(r, list) else []
+    return out
+
+
+# Watch-menu ordering: clean direct players first, ad-heavy hosts last.
+_WATCH_PRIORITY = [
+    ("drive.google", 0),
+    ("mega.nz", 1),
+    ("4shared", 2),
+    ("dailymotion", 3),
+    ("ok.ru", 4),
+    ("videa.hu", 5),
+    ("videas.fr", 6),
+    ("hgcloud", 8), ("streamwish", 8),
+]
+
+
+def _watch_rank(embed_url: str) -> int:
+    u = embed_url.lower()
+    for needle, rank in _WATCH_PRIORITY:
+        if needle in u:
+            return rank
+    return 7
+
+
 async def _watch_entries(ep: dict) -> list[tuple[str, str]]:
     """(label, embed_url) pairs for the watch menu. yonaplay servers are
     expanded into their inner players (e.g. 'Google Drive - HD'); every other
-    server stays a single button."""
-    entries = []
+    server stays a single button. Entries are de-duplicated and ordered
+    clean-players-first (streamwish/ads last)."""
+    players_map = await _expand_yonaplay_all(ep["servers"])
+    entries: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def add(label: str, url: str) -> None:
+        if url and url not in seen:
+            seen.add(url)
+            entries.append((label, url))
+
     for s in ep["servers"]:
         if "yonaplay" in s["name"].lower():
-            players = await asyncio.to_thread(scraper.get_yonaplay_players, s["embed_url"])
-            if players:
-                for p in players:
-                    entries.append((f"{p['host']} - {p['quality']}", p["url"]))
-                continue
-        entries.append((s["name"], s["embed_url"]))
+            for p in players_map.get(s["embed_url"], []):
+                add(f"{p['host']} - {p['quality']}", p["url"])
+            # raw yonaplay is dropped on purpose: it 404s without a witanime
+            # Referer (black screen) — its inner players replace it.
+            continue
+        add(s["name"], s["embed_url"])
+
+    entries.sort(key=lambda e: _watch_rank(e[1]))
     return entries
 
 
 async def _video_options(ep: dict) -> list[dict]:
     """Quality choices for 'send video here': Google Drive links (HD/FHD)
     extracted from yonaplay players + ok.ru (best quality on resolve)."""
+    players_map = await _expand_yonaplay_all(ep["servers"])
     options = []
+    seen_drive = set()
     for s in ep["servers"]:
         name = s["name"].lower()
         if "yonaplay" in name:
-            players = await asyncio.to_thread(scraper.get_yonaplay_players, s["embed_url"])
-            for p in players:
-                if "drive.google" in p["url"]:
+            for p in players_map.get(s["embed_url"], []):
+                if "drive.google" in p["url"] and p["url"] not in seen_drive:
+                    seen_drive.add(p["url"])
                     options.append(
                         {
                             "label": f"Google Drive - {p['quality']}",
@@ -533,19 +605,23 @@ async def show_video_qualities(query_obj, tok: str) -> None:
         log.exception("episode fetch failed: %s", ep_url)
         await query_obj.answer(ERR_FETCH, show_alert=True)
         return
-    options = await _video_options(ep)
-    if not options:
-        await query_obj.answer(
-            "لا توجد مصادر إرسال مباشر متاحة لهذه الحلقة 😕 استخدم المشاهدة أو التحميل",
-            show_alert=True,
+    try:
+        options = await _video_options(ep)
+        if not options:
+            await query_obj.answer(
+                "لا توجد مصادر إرسال مباشر متاحة لهذه الحلقة 😕 استخدم المشاهدة أو التحميل",
+                show_alert=True,
+            )
+            return
+        limit = "2 جيجا" if LOCAL_BOT_API else "45 ميجا"
+        await query_obj.edit_message_text(
+            f"📤 إرسال الفيديو — {ep['anime_title']} الحلقة {ep['number']}\n"
+            f"اختر الجودة (الحد الأقصى للإرسال: {limit}):",
+            reply_markup=video_qualities_keyboard(options, tok),
         )
-        return
-    limit = "2 جيجا" if LOCAL_BOT_API else "45 ميجا"
-    await query_obj.edit_message_text(
-        f"📤 إرسال الفيديو — {ep['anime_title']} الحلقة {ep['number']}\n"
-        f"اختر الجودة (الحد الأقصى للإرسال: {limit}):",
-        reply_markup=video_qualities_keyboard(options, tok),
-    )
+    except Exception:
+        log.exception("video qualities menu failed: %s", ep_url)
+        await query_obj.answer("حدث خطأ أثناء تجهيز الجودات ⚠️ حاول مرة أخرى", show_alert=True)
 
 
 async def start_video_send(query_obj, qtok: str) -> None:
@@ -762,6 +838,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await q.answer()
     except Exception:
         log.exception("callback handler failed: %s", data)
+        # never leave the user with a dead button — always give feedback
+        with contextlib.suppress(Exception):
+            await q.answer("حدث خطأ مؤقت ⚠️ حاول مرة أخرى", show_alert=True)
         with contextlib.suppress(Exception):
             await q.message.reply_text(ERR_FETCH)
 
