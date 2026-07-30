@@ -595,8 +595,10 @@ async def show_panel(query_obj, tok: str) -> None:
 
 async def show_video_qualities(query_obj, tok: str) -> None:
     """'📤 إرسال الفيديو هنا' -> quality menu (Google Drive HD/FHD + ok.ru)."""
+    log.info("vid flow: pressed (tok=%s)", tok)
     ep_url = get_url(tok)
     if not ep_url:
+        log.warning("vid flow: expired token %s", tok)
         await query_obj.answer(ERR_EXPIRED, show_alert=True)
         return
     try:
@@ -605,8 +607,11 @@ async def show_video_qualities(query_obj, tok: str) -> None:
         log.exception("episode fetch failed: %s", ep_url)
         await query_obj.answer(ERR_FETCH, show_alert=True)
         return
+    log.info("vid flow: episode fetched: %s ep %s (%d servers)",
+             ep["anime_title"], ep["number"], len(ep["servers"]))
     try:
         options = await _video_options(ep)
+        log.info("vid flow: %d send options", len(options))
         if not options:
             await query_obj.answer(
                 "لا توجد مصادر إرسال مباشر متاحة لهذه الحلقة 😕 استخدم المشاهدة أو التحميل",
@@ -614,14 +619,26 @@ async def show_video_qualities(query_obj, tok: str) -> None:
             )
             return
         limit = "2 جيجا" if LOCAL_BOT_API else "45 ميجا"
-        await query_obj.edit_message_text(
-            f"📤 إرسال الفيديو — {ep['anime_title']} الحلقة {ep['number']}\n"
-            f"اختر الجودة (الحد الأقصى للإرسال: {limit}):",
-            reply_markup=video_qualities_keyboard(options, tok),
-        )
+        try:
+            await query_obj.edit_message_text(
+                f"📤 إرسال الفيديو — {ep['anime_title']} الحلقة {ep['number']}\n"
+                f"اختر الجودة (الحد الأقصى للإرسال: {limit}):",
+                reply_markup=video_qualities_keyboard(options, tok),
+            )
+        except Exception:
+            # message too old to edit (>48h) or already replaced -> send a new one
+            log.info("vid flow: edit failed, sending fresh message instead")
+            await query_obj.message.reply_text(
+                f"📤 إرسال الفيديو — {ep['anime_title']} الحلقة {ep['number']}\n"
+                f"اختر الجودة (الحد الأقصى للإرسال: {limit}):",
+                reply_markup=video_qualities_keyboard(options, tok),
+            )
     except Exception:
         log.exception("video qualities menu failed: %s", ep_url)
-        await query_obj.answer("حدث خطأ أثناء تجهيز الجودات ⚠️ حاول مرة أخرى", show_alert=True)
+        with contextlib.suppress(Exception):
+            await query_obj.answer("حدث خطأ أثناء تجهيز الجودات ⚠️ حاول مرة أخرى", show_alert=True)
+        with contextlib.suppress(Exception):
+            await query_obj.message.reply_text("حدث خطأ أثناء تجهيز الجودات ⚠️ حاول مرة أخرى")
 
 
 async def start_video_send(query_obj, qtok: str) -> None:
@@ -829,18 +846,23 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await q.answer()
             await show_downloads(q, parts[1])
         elif kind == "vid":
-            await q.answer()
+            with contextlib.suppress(Exception):
+                await q.answer()
             await show_video_qualities(q, parts[1])
         elif kind == "vq":  # video quality chosen -> start the send flow
             await q.answer()
             await start_video_send(q, parts[1])
         else:
-            await q.answer()
+            log.warning("unknown callback data: %r", data)
+            with contextlib.suppress(Exception):
+                await q.answer("الزر ده من رسالة قديمة — ابحث من جديد 🔍", show_alert=True)
     except Exception:
         log.exception("callback handler failed: %s", data)
         # never leave the user with a dead button — always give feedback
         with contextlib.suppress(Exception):
             await q.answer("حدث خطأ مؤقت ⚠️ حاول مرة أخرى", show_alert=True)
+        with contextlib.suppress(Exception):
+            await q.message.reply_text("حدث خطأ مؤقت ⚠️ حاول مرة أخرى")
         with contextlib.suppress(Exception):
             await q.message.reply_text(ERR_FETCH)
 
