@@ -514,6 +514,7 @@ async def _video_options(ep: dict) -> list[dict]:
     players_map = await _expand_yonaplay_all(ep["servers"])
     options = []
     seen_drive = set()
+    seen_mega = set()
     for s in ep["servers"]:
         name = s["name"].lower()
         if "yonaplay" in name:
@@ -527,9 +528,23 @@ async def _video_options(ep: dict) -> list[dict]:
                             "url": p["url"],
                         }
                     )
+                elif "mega.nz" in p["url"] and p["url"] not in seen_mega:
+                    seen_mega.add(p["url"])
+                    options.append(
+                        {
+                            "label": f"Mega - {p['quality']}",
+                            "kind": "mega",
+                            "url": p["url"],
+                        }
+                    )
         elif "ok.ru" in name or "odnoklassniki" in name or "ok.ru" in s["embed_url"]:
             options.append(
                 {"label": f"{s['name']} - أفضل جودة", "kind": "okru", "url": s["embed_url"]}
+            )
+        elif "mega.nz" in s["embed_url"] and s["embed_url"] not in seen_mega:
+            seen_mega.add(s["embed_url"])
+            options.append(
+                {"label": s["name"], "kind": "mega", "url": s["embed_url"]}
             )
     return options
 
@@ -715,7 +730,11 @@ async def _progress_updater(progress, state: dict) -> None:
     """Edit the progress message every ~5s with the downloaded MB."""
     while True:
         await asyncio.sleep(5)
-        mb = state["done"] / (1024 * 1024)
+        done = state["done"]
+        path = state.get("path")
+        if path and os.path.isfile(path):
+            done = os.path.getsize(path)
+        mb = done / (1024 * 1024)
         total = state.get("total") or 0
         text = f"{MSG_PREPARING}\n⬇️ تم تنزيل {mb:.0f} ميجا"
         if total:
@@ -728,27 +747,52 @@ async def _send_video_inner(query_obj, progress, chat_id: int, ep_url: str,
                             kind: str, source_url: str) -> None:
     ep = await fetch_episode(ep_url)
 
-    if kind == "drive":
-        mp4_url = await asyncio.to_thread(resolvers.resolve_drive_mp4, source_url)
-    else:  # okru
-        mp4_url = await asyncio.to_thread(resolvers.resolve_mp4, source_url)
-    if not mp4_url:
-        await query_obj.message.reply_text(MSG_RESOLVE_FAIL)
-        return
-
     tmp = tempfile.NamedTemporaryFile(prefix="witanime-", suffix=".mp4", delete=False)
     tmp_path = tmp.name
     tmp.close()
-    state = {"done": 0, "total": 0}
+    state = {"done": 0, "total": 0, "path": None}
+
+    mega_url = None
+    if kind == "mega":
+        mega_url = resolvers.normalize_mega_url(source_url) or source_url
+        size = await asyncio.to_thread(resolvers.get_mega_size, mega_url)
+        if size:
+            state["total"] = size
+            if size > MAX_VIDEO_BYTES:
+                os.unlink(tmp_path)
+                await _reply_too_big(query_obj, ep, source_url, size)
+                return
+        state["path"] = tmp_path  # progress tracked by polling file size
+        log.info("mega source ready (%s MB known)", (size or 0) // (1024 * 1024))
+        mp4_url = None
+    elif kind == "drive":
+        mp4_url = await asyncio.to_thread(resolvers.resolve_drive_mp4, source_url)
+    else:  # okru
+        mp4_url = await asyncio.to_thread(resolvers.resolve_mp4, source_url)
+    if kind != "mega" and not mp4_url:
+        os.unlink(tmp_path)
+        await query_obj.message.reply_text(MSG_RESOLVE_FAIL)
+        return
+
     updater = asyncio.create_task(_progress_updater(progress, state))
     try:
         try:
-            await asyncio.to_thread(_download_to_temp, mp4_url, tmp_path, state)
+            if kind == "mega":
+                await asyncio.to_thread(resolvers.download_mega, mega_url, tmp_path)
+                state["done"] = os.path.getsize(tmp_path)
+                if state["done"] > MAX_VIDEO_BYTES:
+                    raise TooBigError(state["done"])
+            else:
+                await asyncio.to_thread(_download_to_temp, mp4_url, tmp_path, state)
         except TooBigError as exc:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
             await _reply_too_big(query_obj, ep, source_url, exc.size)
             return
-        except requests.RequestException:
-            log.exception("download failed: %s", mp4_url)
+        except Exception:
+            log.exception("download failed (kind=%s)", kind)
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
             await query_obj.message.reply_text(MSG_RESOLVE_FAIL)
             return
     finally:

@@ -4,3 +4,4 @@ beautifulsoup4>=4.12
 fastapi>=0.110
 uvicorn>=0.29
 python-dotenv>=1.0
+mega.py>=1.0.8

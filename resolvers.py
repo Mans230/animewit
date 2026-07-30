@@ -136,3 +136,40 @@ def resolve_mp4(embed_url: str) -> str | None:
     except Exception as exc:
         log.warning("resolve_mp4(%s) failed: %s", embed_url, exc)
         return None
+
+
+# ---------------------------------------------------------------------------
+# Mega.nz — public file links are directly downloadable via the Mega API
+# (mega.py library). Embed URLs (mega.nz/embed/ID#KEY) are equivalent to
+# /file/ URLs, so we normalize first.
+# ---------------------------------------------------------------------------
+def normalize_mega_url(url: str) -> str | None:
+    """Return a canonical mega.nz/file/... URL, or None if not a Mega link."""
+    if not url or "mega.nz" not in url:
+        return None
+    return url.replace("/embed/", "/file/")
+
+
+def get_mega_size(url: str) -> int | None:
+    """Best-effort remote size lookup for a public Mega file (bytes)."""
+    try:
+        from mega import Mega
+        info = Mega().get_public_url_info(url)
+        size = int((info or {}).get("size") or 0)
+        return size or None
+    except Exception as exc:  # noqa: BLE001 — size is best-effort only
+        log.warning("mega size lookup failed: %s", exc)
+        return None
+
+
+def download_mega(url: str, path: str) -> int:
+    """Blocking download of a public Mega file to `path`. Returns bytes written.
+    Raises on any failure — the caller reports MSG_RESOLVE_FAIL."""
+    import os as _os
+
+    from mega import Mega
+
+    dest_dir = _os.path.dirname(path)
+    dest_name = _os.path.basename(path)
+    Mega().download_url(url, dest_path=dest_dir, dest_filename=dest_name)
+    return _os.path.getsize(path)
