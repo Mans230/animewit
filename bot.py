@@ -778,8 +778,7 @@ async def _send_video_inner(query_obj, progress, chat_id: int, ep_url: str,
     try:
         try:
             if kind == "mega":
-                await asyncio.to_thread(resolvers.download_mega, mega_url, tmp_path)
-                state["done"] = os.path.getsize(tmp_path)
+                await asyncio.to_thread(resolvers.download_mega, mega_url, tmp_path, state)
                 if state["done"] > MAX_VIDEO_BYTES:
                     raise TooBigError(state["done"])
             else:

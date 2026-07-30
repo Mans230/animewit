@@ -8,10 +8,13 @@ Supported:
   stream at drive.usercontent.google.com and verify it serves video bytes.
 """
 
+import base64
 import html as html_module
 import json
 import logging
+import random
 import re
+import struct
 
 import requests
 
@@ -139,37 +142,111 @@ def resolve_mp4(embed_url: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Mega.nz — public file links are directly downloadable via the Mega API
-# (mega.py library). Embed URLs (mega.nz/embed/ID#KEY) are equivalent to
-# /file/ URLs, so we normalize first.
+# Mega.nz — minimal public-file downloader implemented directly on the Mega
+# API (no third-party library: mega.py pins an ancient tenacity that is
+# broken on Python 3.11+). A public file link carries a 256-bit key in its
+# URL fragment; the file is fetched from g.api.mega.nz and decrypted inline
+# with AES-CTR.
 # ---------------------------------------------------------------------------
+_MEGA_API = "https://g.api.mega.nz/cs"
+_MEGA_ERRORS = {
+    -1: "internal error",
+    -2: "bad arguments",
+    -3: "temporary failure (retry)",
+    -9: "file not found",
+    -11: "access violation (deleted/protected)",
+    -16: "file blocked",
+    -17: "over quota",
+}
+
+
 def normalize_mega_url(url: str) -> str | None:
-    """Return a canonical mega.nz/file/... URL, or None if not a Mega link."""
+    """Return the URL unchanged if it is a Mega link, else None.
+    (Both /file/ and /embed/ formats are parsed directly.)"""
     if not url or "mega.nz" not in url:
         return None
-    return url.replace("/embed/", "/file/")
+    return url
+
+
+def _mega_b64d(s: str) -> bytes:
+    s += "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode(s)
+
+
+def _parse_mega_url(url: str) -> tuple[str, str] | None:
+    """Extract (file_id, key_b64) from /file/, /embed/ and legacy #! URLs."""
+    m = re.search(r"mega\.nz/(?:file|embed)/([A-Za-z0-9_-]+)[#!]([A-Za-z0-9_-]+)", url)
+    if not m:
+        m = re.search(r"mega\.nz/#!([A-Za-z0-9_-]+)!([A-Za-z0-9_-]+)", url)
+    return (m.group(1), m.group(2)) if m else None
+
+
+def _mega_api(payload: dict) -> dict:
+    """Single Mega API call; returns the response object or raises."""
+    r = requests.post(
+        _MEGA_API,
+        params={"id": str(random.randint(0, 0xFFFFFFFF))},
+        json=[payload],
+        timeout=TIMEOUT,
+    )
+    r.raise_for_status()
+    data = r.json()
+    if not isinstance(data, list) or not data:
+        raise RuntimeError("mega: empty api response")
+    item = data[0]
+    if isinstance(item, int):
+        raise RuntimeError(f"mega api error {item}: {_MEGA_ERRORS.get(item, 'unknown')}")
+    if "g" not in item:
+        raise RuntimeError("mega: file not accessible")
+    return item
+
+
+def _mega_key_iv(key_b64: str) -> tuple[bytes, int]:
+    """Derive the 128-bit AES key and CTR initial value from the URL key."""
+    fk = struct.unpack(">8I", _mega_b64d(key_b64))
+    key = struct.pack(">4I", fk[0] ^ fk[4], fk[1] ^ fk[5], fk[2] ^ fk[6], fk[3] ^ fk[7])
+    iv_init = ((fk[4] << 32) + fk[5]) << 64
+    return key, iv_init
 
 
 def get_mega_size(url: str) -> int | None:
     """Best-effort remote size lookup for a public Mega file (bytes)."""
     try:
-        from mega import Mega
-        info = Mega().get_public_url_info(url)
-        size = int((info or {}).get("size") or 0)
-        return size or None
+        parsed = _parse_mega_url(url)
+        if not parsed:
+            return None
+        item = _mega_api({"a": "g", "g": 1, "p": parsed[0]})
+        return int(item.get("s") or 0) or None
     except Exception as exc:  # noqa: BLE001 — size is best-effort only
         log.warning("mega size lookup failed: %s", exc)
         return None
 
 
-def download_mega(url: str, path: str) -> int:
-    """Blocking download of a public Mega file to `path`. Returns bytes written.
-    Raises on any failure — the caller reports MSG_RESOLVE_FAIL."""
-    import os as _os
+def download_mega(url: str, path: str, state: dict | None = None) -> int:
+    """Blocking download+decrypt of a public Mega file to `path`.
+    `state["done"]`/`state["total"]` are updated for progress reporting.
+    Returns bytes written; raises on any failure."""
+    from Crypto.Cipher import AES
+    from Crypto.Util import Counter
 
-    from mega import Mega
-
-    dest_dir = _os.path.dirname(path)
-    dest_name = _os.path.basename(path)
-    Mega().download_url(url, dest_path=dest_dir, dest_filename=dest_name)
-    return _os.path.getsize(path)
+    parsed = _parse_mega_url(url)
+    if not parsed:
+        raise RuntimeError("mega: unsupported url format")
+    file_id, key_b64 = parsed
+    key, iv_init = _mega_key_iv(key_b64)
+    item = _mega_api({"a": "g", "g": 1, "p": file_id})
+    total = int(item.get("s") or 0)
+    if state is not None:
+        state["total"] = total
+    counter = Counter.new(128, initial_value=iv_init)
+    aes = AES.new(key, AES.MODE_CTR, counter=counter)
+    written = 0
+    with requests.get(item["g"], stream=True, timeout=60) as r:
+        r.raise_for_status()
+        with open(path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 512):
+                f.write(aes.decrypt(chunk))
+                written += len(chunk)
+                if state is not None:
+                    state["done"] = written
+    return written
