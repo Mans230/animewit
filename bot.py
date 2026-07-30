@@ -813,7 +813,7 @@ async def _send_video_inner(query_obj, progress, chat_id: int, ep_url: str,
     try:
         caption = f"🎬 {ep['anime_title']} — الحلقة {ep['number']}"
         with open(tmp_path, "rb") as video_file:
-            await query_obj.bot.send_video(
+            await query_obj.get_bot().send_video(
                 chat_id=chat_id,
                 video=video_file,
                 filename=f"episode-{ep['number']}.mp4",

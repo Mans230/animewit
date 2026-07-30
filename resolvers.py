@@ -333,13 +333,20 @@ class _SniIpAdapter(HTTPAdapter):
         self._ip = ip
         super().__init__()
 
-    def get_connection(self, url, proxies=None):
+    def _ip_pool(self):
         return self.poolmanager.connection_from_host(
             self._ip,
             port=443,
             scheme="https",
             pool_kwargs={"assert_hostname": self._host, "server_hostname": self._host},
         )
+
+    def get_connection(self, url, proxies=None):  # requests < 2.32
+        return self._ip_pool()
+
+    def get_connection_with_tls_context(self, request, verify, proxies=None, cert=None):
+        # requests >= 2.32 — send() calls THIS, not get_connection
+        return self._ip_pool()
 
 
 def _http_for(host: str) -> "requests.Session | requests":
