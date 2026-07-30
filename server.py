@@ -11,9 +11,54 @@ import base64
 import hashlib
 import hmac
 import html
+import logging
+import time
 
+import requests
 from fastapi import FastAPI, Query
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
+
+log = logging.getLogger(__name__)
+
+# --- anti-iframe challenge detection ---------------------------------------
+# Some ad-heavy hosts (upvideo, streamsb/sbanh, highload, ...) answer embed
+# requests with a tiny JS "Redirecting..." anti-abuse challenge that never
+# completes inside a third-party iframe (black screen). We probe each embed
+# once (cached) and, when the challenge is detected, redirect the browser to
+# the embed URL top-level instead of iframing it — the challenge then runs
+# full-window and the player works.
+_CHALLENGE_CACHE: dict[str, tuple[bool, float]] = {}
+_CHALLENGE_TTL = 6 * 3600
+_DESKTOP_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+
+
+def _has_iframe_challenge(embed_url: str) -> bool:
+    cached = _CHALLENGE_CACHE.get(embed_url)
+    if cached and time.time() - cached[1] < _CHALLENGE_TTL:
+        return cached[0]
+    result = False
+    try:
+        try:
+            r = requests.get(
+                embed_url, headers={"User-Agent": _DESKTOP_UA}, timeout=6
+            )
+        except requests.exceptions.SSLError:
+            r = requests.get(
+                embed_url, headers={"User-Agent": _DESKTOP_UA}, timeout=6, verify=False
+            )
+        body = r.text[:20000]
+        result = "adBlockingDetected" in body or "<title>Redirecting" in body
+    except Exception as exc:
+        log.info("challenge probe failed for %s: %s", embed_url, exc)
+    if len(_CHALLENGE_CACHE) > 2000:
+        _CHALLENGE_CACHE.clear()
+    _CHALLENGE_CACHE[embed_url] = (result, time.time())
+    if result:
+        log.info("iframe challenge detected -> redirect mode: %s", embed_url)
+    return result
 
 WATCH_PAGE = """<!DOCTYPE html>
 <html lang="ar" dir="rtl">
@@ -40,7 +85,6 @@ WATCH_PAGE = """<!DOCTYPE html>
 <div id="loading">جاري تحميل المشغل... ⏳</div>
 <iframe src="{src}" allowfullscreen scrolling="no"
         referrerpolicy="no-referrer"
-        sandbox="allow-scripts allow-same-origin allow-presentation allow-forms"
         allow="autoplay; fullscreen; encrypted-media; picture-in-picture"
         onload="document.getElementById('loading').style.display='none'"></iframe>
 <div id="fallback"><a href="{src}" target="_blank" rel="noopener">فتح في تاب جديد ↗</a></div>
@@ -86,6 +130,9 @@ def build_app(watch_secret: str) -> FastAPI:
             return PlainTextResponse("Bad Request", status_code=400)
         if not embed_url.startswith(("http://", "https://")):
             return PlainTextResponse("Bad Request", status_code=400)
+        if _has_iframe_challenge(embed_url):
+            # anti-iframe host: send the browser straight to the player page
+            return RedirectResponse(embed_url, status_code=302)
         src = html.escape(embed_url, quote=True)
         return HTMLResponse(WATCH_PAGE.format(src=src))
 

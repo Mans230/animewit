@@ -10,4 +10,4 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
-CMD sh -c 'if [ -n "$TG_API_ID" ] && [ -n "$TG_API_HASH" ]; then telegram-bot-api --local --api-id=$TG_API_ID --api-hash=$TG_API_HASH --http-port=8081 --dir=/tmp/tgapi & fi; exec python bot.py'
+CMD sh -c 'if [ -n "$TG_API_ID" ] && [ -n "$TG_API_HASH" ]; then mkdir -p /tmp/tgapi && telegram-bot-api --local --api-id=$TG_API_ID --api-hash=$TG_API_HASH --http-port=8081 --dir=/tmp/tgapi & fi; exec python bot.py'

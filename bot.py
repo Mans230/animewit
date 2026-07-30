@@ -397,7 +397,15 @@ async def show_episodes_page(query_obj, anime_url: str, page: int) -> None:
             reply_markup=episodes_keyboard(anime_url, info, page)
         )
     except Exception as exc:
-        log.debug("edit markup failed: %s", exc)
+        # edit can fail (old message, API hiccup) — fall back to a fresh
+        # message so pagination never feels dead
+        log.info("episodes edit failed (%s) — sending fresh page", exc)
+        kb = episodes_keyboard(anime_url, info, page)
+        total_pages = max(1, (len(info["episodes"]) + EPS_PER_PAGE - 1) // EPS_PER_PAGE)
+        await query_obj.message.reply_text(
+            f"📺 {info['title']}\n📑 صفحة {page + 1}/{total_pages} — اختر الحلقة:",
+            reply_markup=kb,
+        )
 
 
 async def _ensure_anime_cached(ep: dict) -> None:
@@ -633,7 +641,8 @@ async def show_video_qualities(query_obj, tok: str) -> None:
                 show_alert=True,
             )
             return
-        limit = "2 جيجا" if LOCAL_BOT_API else "45 ميجا"
+        # reflect the REAL active limit (local API may have failed to start)
+        limit = "2 جيجا" if MAX_VIDEO_BYTES > 100 * 1024 * 1024 else "45 ميجا"
         try:
             await query_obj.edit_message_text(
                 f"📤 إرسال الفيديو — {ep['anime_title']} الحلقة {ep['number']}\n"
@@ -830,10 +839,10 @@ async def _reply_too_big(query_obj, ep: dict, embed_url: str, size: int) -> None
         f"حجم الفيديو كبير ({mb:.0f} ميجا) ولا يمكن إرساله هنا 😅\n"
         "يمكنك المشاهدة مباشرة أو التحميل من الروابط:"
     )
-    if not LOCAL_BOT_API:
+    if MAX_VIDEO_BYTES < 100 * 1024 * 1024:
         text += (
-            "\n\n💡 ملاحظة: حد تليجرام للبوتات 50 ميجا. يمكن رفعه إلى 2 جيجا "
-            "بتفعيل TG_API_ID و TG_API_HASH (سيرفر Bot API محلي)."
+            "\n\n💡 ملاحظة: سيرفر البوت API المحلي مش شغال حالياً — الحد 45 ميجا. "
+            "بعد إصلاحه هيتم الإرسال حتى 2 جيجا تلقائياً."
         )
     await query_obj.message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
 
@@ -855,9 +864,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             _, results = entry
             page = max(0, int(parts[2]))
             await q.answer()
-            await q.edit_message_reply_markup(
-                reply_markup=search_keyboard(parts[1], results, page)
-            )
+            try:
+                await q.edit_message_reply_markup(
+                    reply_markup=search_keyboard(parts[1], results, page)
+                )
+            except Exception as exc:
+                log.info("search page edit failed (%s) — sending fresh page", exc)
+                await q.message.reply_text(
+                    "📑 صفحة جديدة من النتائج:",
+                    reply_markup=search_keyboard(parts[1], results, page),
+                )
         elif kind in ("anime", "a"):  # open anime
             anime_url = resolve_anime_ref(kind, parts[1])
             if not anime_url:
