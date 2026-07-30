@@ -14,9 +14,12 @@ import json
 import logging
 import random
 import re
+import socket
 import struct
+from urllib.parse import urlparse
 
 import requests
+from requests.adapters import HTTPAdapter
 
 log = logging.getLogger(__name__)
 
@@ -181,9 +184,123 @@ def _parse_mega_url(url: str) -> tuple[str, str] | None:
     return (m.group(1), m.group(2)) if m else None
 
 
+# ---------------------------------------------------------------------------
+# DNS-resilient HTTP layer. Some hosts (e.g. Railway) refuse to resolve
+# mega.nz domains at the DNS level, so we fall back to resolving the host
+# ourselves — via DNS-over-HTTPS or a raw UDP query to public resolvers —
+# and then connect to the IP directly while keeping TLS SNI + certificate
+# verification for the original hostname.
+# ---------------------------------------------------------------------------
+_DNS_CACHE: dict[str, str] = {}
+
+
+def _doh_resolve(host: str) -> str | None:
+    """Resolve host via DNS-over-HTTPS (Google, then Cloudflare)."""
+    endpoints = [
+        ("https://dns.google/resolve", {}),
+        ("https://cloudflare-dns.com/dns-query", {"accept": "application/dns-json"}),
+    ]
+    for url, headers in endpoints:
+        try:
+            r = requests.get(
+                url, params={"name": host, "type": "A"}, headers=headers, timeout=10
+            )
+            for ans in r.json().get("Answer") or []:
+                if ans.get("type") == 1:
+                    return ans["data"]
+        except Exception as exc:
+            log.debug("DoH %s failed for %s: %s", url, host, exc)
+    return None
+
+
+def _udp_resolve(host: str, server: str = "8.8.8.8", timeout: float = 5.0) -> str | None:
+    """Minimal raw UDP DNS A-record query (bypasses a filtering resolver)."""
+    try:
+        tid = random.randint(0, 0xFFFF)
+        q = struct.pack(">HHHHHH", tid, 0x0100, 1, 0, 0, 0)
+        for part in host.split("."):
+            q += bytes([len(part)]) + part.encode()
+        q += b"\x00" + struct.pack(">HH", 1, 1)  # type A, class IN
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(timeout)
+            sock.sendto(q, (server, 53))
+            data, _ = sock.recvfrom(512)
+        if len(data) < 12:
+            return None
+        ancount = struct.unpack(">H", data[6:8])[0]
+        i = 12
+        while data[i] != 0:  # skip question name
+            i += data[i] + 1
+        i += 5  # null byte + qtype + qclass
+        for _ in range(ancount):
+            if data[i] & 0xC0 == 0xC0:  # compressed name pointer
+                i += 2
+            else:
+                while data[i] != 0:
+                    i += data[i] + 1
+                i += 1
+            rtype, _rclass, _ttl, rdlen = struct.unpack(">HHIH", data[i : i + 10])
+            i += 10
+            if rtype == 1 and rdlen == 4:
+                return socket.inet_ntoa(data[i : i + 4])
+            i += rdlen
+    except Exception as exc:
+        log.debug("UDP DNS %s failed for %s: %s", server, host, exc)
+    return None
+
+
+def _resolve_host(host: str) -> str:
+    """Resolve `host` to an IPv4 address, bypassing broken/filtering DNS."""
+    if host in _DNS_CACHE:
+        return _DNS_CACHE[host]
+    try:
+        ip = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)[0][4][0]
+    except socket.gaierror:
+        ip = None
+    if not ip:
+        log.info("system DNS failed for %s — trying DoH/UDP fallbacks", host)
+        ip = _doh_resolve(host) or _udp_resolve(host) or _udp_resolve(host, "1.1.1.1")
+    if not ip:
+        raise RuntimeError(f"cannot resolve {host}")
+    _DNS_CACHE[host] = ip
+    return ip
+
+
+class _SniIpAdapter(HTTPAdapter):
+    """Connect to a fixed IP while keeping TLS SNI and certificate
+    hostname verification for the original domain."""
+
+    def __init__(self, host: str, ip: str):
+        self._host = host
+        self._ip = ip
+        super().__init__()
+
+    def get_connection(self, url, proxies=None):
+        return self.poolmanager.connection_from_host(
+            self._ip,
+            port=443,
+            scheme="https",
+            pool_kwargs={"assert_hostname": self._host, "server_hostname": self._host},
+        )
+
+
+def _http_for(host: str) -> "requests.Session | requests":
+    """Return an HTTP client able to reach `host` even when the local
+    resolver refuses it (connects to a self-resolved IP with proper SNI)."""
+    try:
+        socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+        return requests
+    except socket.gaierror:
+        ip = _resolve_host(host)
+        s = requests.Session()
+        s.mount("https://", _SniIpAdapter(host, ip))
+        return s
+
+
 def _mega_api(payload: dict) -> dict:
     """Single Mega API call; returns the response object or raises."""
-    r = requests.post(
+    http = _http_for("g.api.mega.nz")
+    r = http.post(
         _MEGA_API,
         params={"id": str(random.randint(0, 0xFFFFFFFF))},
         json=[payload],
@@ -241,7 +358,9 @@ def download_mega(url: str, path: str, state: dict | None = None) -> int:
     counter = Counter.new(128, initial_value=iv_init)
     aes = AES.new(key, AES.MODE_CTR, counter=counter)
     written = 0
-    with requests.get(item["g"], stream=True, timeout=60) as r:
+    dl_host = urlparse(item["g"]).hostname
+    http = _http_for(dl_host) if dl_host else requests
+    with http.get(item["g"], stream=True, timeout=60) as r:
         r.raise_for_status()
         with open(path, "wb") as f:
             for chunk in r.iter_content(chunk_size=1024 * 512):
