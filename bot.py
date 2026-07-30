@@ -94,12 +94,24 @@ MSG_RESOLVE_FAIL = "تعذّر تجهيز الفيديو من هذا المصد�
 
 RESULTS_PER_PAGE = 10
 EPS_PER_PAGE = 20
-if LOCAL_BOT_API:
-    MAX_VIDEO_BYTES = 1990 * 1024 * 1024  # ~2GB (local Bot API limit)
-    VIDEO_TOTAL_TIMEOUT = 3600  # seconds — 2GB downloads need time
-else:
-    MAX_VIDEO_BYTES = 45 * 1024 * 1024  # 45MB safety margin (cloud Bot API limit: 50MB)
-    VIDEO_TOTAL_TIMEOUT = 600  # seconds
+# Defaults: cloud Bot API limits. Upgraded in main() if the local API is reachable.
+MAX_VIDEO_BYTES = 45 * 1024 * 1024  # 45MB safety margin (cloud Bot API limit: 50MB)
+VIDEO_TOTAL_TIMEOUT = 600  # seconds
+
+
+def _wait_for_local_api(timeout_s: int = 30) -> bool:
+    """Wait until the local telegram-bot-api (started by the Docker CMD) accepts
+    TCP connections on :8081. Returns False on timeout so we can fall back to the
+    cloud Bot API instead of crash-looping."""
+    import socket
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", 8081), timeout=2):
+                return True
+        except OSError:
+            time.sleep(1.5)
+    return False
 # Limit concurrent video downloads (each writes to a temp file in /tmp).
 VIDEO_SEND_SEM = asyncio.Semaphore(2)
 
@@ -798,12 +810,26 @@ def main() -> None:
         sys.exit("BASE_PUBLIC_URL is required (your public Railway domain)")
 
     builder = Application.builder().token(BOT_TOKEN)
+    use_local_api = False
     if LOCAL_BOT_API:
-        # Talk to the local telegram-bot-api started by the Docker CMD.
-        builder = builder.base_url(f"{LOCAL_API_URL}/bot").base_file_url(
-            f"{LOCAL_API_URL}/file/bot"
-        )
-        log.info("using local Bot API at %s (2GB send limit)", LOCAL_API_URL)
+        # Talk to the local telegram-bot-api started by the Docker CMD — but only
+        # if it is actually up; otherwise fall back to the cloud API gracefully.
+        log.info("waiting for local Bot API on %s ...", LOCAL_API_URL)
+        use_local_api = _wait_for_local_api()
+        if use_local_api:
+            global MAX_VIDEO_BYTES, VIDEO_TOTAL_TIMEOUT
+            MAX_VIDEO_BYTES = 1990 * 1024 * 1024  # ~2GB (local Bot API limit)
+            VIDEO_TOTAL_TIMEOUT = 3600  # seconds — 2GB downloads need time
+            builder = builder.base_url(f"{LOCAL_API_URL}/bot").base_file_url(
+                f"{LOCAL_API_URL}/file/bot"
+            )
+            log.info("using local Bot API at %s (2GB send limit)", LOCAL_API_URL)
+        else:
+            log.warning(
+                "local Bot API unreachable on %s — falling back to cloud Bot API "
+                "(50MB send limit). Check TG_API_ID/TG_API_HASH and Dockerfile.",
+                LOCAL_API_URL,
+            )
     app = builder.build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
