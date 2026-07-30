@@ -151,7 +151,9 @@ def resolve_mp4(embed_url: str) -> str | None:
 # URL fragment; the file is fetched from g.api.mega.nz and decrypted inline
 # with AES-CTR.
 # ---------------------------------------------------------------------------
-_MEGA_API = "https://g.api.mega.nz/cs"
+# The API answers on both domains; mega.co.nz is an old alias that DNS
+# filters often forget to block.
+_MEGA_API_HOSTS = ("g.api.mega.nz", "g.api.mega.co.nz")
 _MEGA_ERRORS = {
     -1: "internal error",
     -2: "bad arguments",
@@ -193,23 +195,76 @@ def _parse_mega_url(url: str) -> tuple[str, str] | None:
 # ---------------------------------------------------------------------------
 _DNS_CACHE: dict[str, str] = {}
 
+# Last-resort hardcoded IPs (Mega's own ranges, stable for years) for hosts
+# whose DNS is aggressively filtered; tried only when every resolver fails.
+_STATIC_IPS: dict[str, list[str]] = {
+    "g.api.mega.nz": ["66.203.125.11", "66.203.125.12", "66.203.125.13"],
+    "g.api.mega.co.nz": ["66.203.125.11", "66.203.125.12", "66.203.125.13"],
+}
 
-def _doh_resolve(host: str) -> str | None:
-    """Resolve host via DNS-over-HTTPS (Google, then Cloudflare)."""
-    endpoints = [
+
+def _doh_json_endpoints() -> list[tuple[str, dict]]:
+    """dns-json compatible DoH resolvers (Google/Cloudflare are commonly
+    blocked by filtering networks, so include less-known ones too)."""
+    return [
         ("https://dns.google/resolve", {}),
         ("https://cloudflare-dns.com/dns-query", {"accept": "application/dns-json"}),
+        ("https://dns.alidns.com/resolve", {"accept": "application/dns-json"}),
+        ("https://doh.pub/resolve", {"accept": "application/dns-json"}),
+        ("https://dns.adguard-dns.com/resolve", {"accept": "application/dns-json"}),
+        ("https://dns.quad9.net/dns-query", {"accept": "application/dns-json"}),
+        ("https://doh.opendns.com/dns-query", {"accept": "application/dns-json"}),
     ]
-    for url, headers in endpoints:
+
+
+def _ips_from_dns_json(data: dict) -> list[str]:
+    return [a["data"] for a in data.get("Answer") or [] if a.get("type") == 1]
+
+
+def _hackertarget_resolve(host: str) -> list[str]:
+    r = requests.get(f"https://api.hackertarget.com/dnslookup/?q={host}", timeout=10)
+    ips = []
+    for line in r.text.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[-2] == "A":
+            ips.append(parts[-1])
+    return ips
+
+
+def _checkhost_resolve(host: str) -> list[str]:
+    r = requests.get(
+        f"https://check-host.net/check-dns?host={host}",
+        headers={"Accept": "application/json"},
+        timeout=10,
+    )
+    ips = []
+    for node in (r.json() or {}).values():
+        if isinstance(node, dict):
+            ips.extend(node.get("A") or [])
+    return ips
+
+
+def _doh_resolve(host: str) -> str | None:
+    """Resolve host via public DNS-over-HTTPS / DNS-lookup APIs."""
+    for url, headers in _doh_json_endpoints():
         try:
             r = requests.get(
                 url, params={"name": host, "type": "A"}, headers=headers, timeout=10
             )
-            for ans in r.json().get("Answer") or []:
-                if ans.get("type") == 1:
-                    return ans["data"]
+            ips = _ips_from_dns_json(r.json())
+            if ips:
+                log.info("resolved %s via %s -> %s", host, url, ips[0])
+                return ips[0]
         except Exception as exc:
-            log.debug("DoH %s failed for %s: %s", url, host, exc)
+            log.info("DoH %s failed for %s: %s", url, host, exc)
+    for name, fn in (("hackertarget", _hackertarget_resolve), ("check-host", _checkhost_resolve)):
+        try:
+            ips = fn(host)
+            if ips:
+                log.info("resolved %s via %s -> %s", host, name, ips[0])
+                return ips[0]
+        except Exception as exc:
+            log.info("%s lookup failed for %s: %s", name, host, exc)
     return None
 
 
@@ -245,7 +300,7 @@ def _udp_resolve(host: str, server: str = "8.8.8.8", timeout: float = 5.0) -> st
                 return socket.inet_ntoa(data[i : i + 4])
             i += rdlen
     except Exception as exc:
-        log.debug("UDP DNS %s failed for %s: %s", server, host, exc)
+        log.info("UDP DNS %s failed for %s: %s", server, host, exc)
     return None
 
 
@@ -260,6 +315,9 @@ def _resolve_host(host: str) -> str:
     if not ip:
         log.info("system DNS failed for %s — trying DoH/UDP fallbacks", host)
         ip = _doh_resolve(host) or _udp_resolve(host) or _udp_resolve(host, "1.1.1.1")
+    if not ip and host in _STATIC_IPS:
+        ip = random.choice(_STATIC_IPS[host])
+        log.info("using static fallback IP for %s -> %s", host, ip)
     if not ip:
         raise RuntimeError(f"cannot resolve {host}")
     _DNS_CACHE[host] = ip
@@ -298,24 +356,34 @@ def _http_for(host: str) -> "requests.Session | requests":
 
 
 def _mega_api(payload: dict) -> dict:
-    """Single Mega API call; returns the response object or raises."""
-    http = _http_for("g.api.mega.nz")
-    r = http.post(
-        _MEGA_API,
-        params={"id": str(random.randint(0, 0xFFFFFFFF))},
-        json=[payload],
-        timeout=TIMEOUT,
-    )
-    r.raise_for_status()
-    data = r.json()
-    if not isinstance(data, list) or not data:
-        raise RuntimeError("mega: empty api response")
-    item = data[0]
-    if isinstance(item, int):
-        raise RuntimeError(f"mega api error {item}: {_MEGA_ERRORS.get(item, 'unknown')}")
-    if "g" not in item:
-        raise RuntimeError("mega: file not accessible")
-    return item
+    """Single Mega API call over the first reachable API host; raises on
+    total failure."""
+    last_exc: Exception | None = None
+    for host in _MEGA_API_HOSTS:
+        try:
+            http = _http_for(host)
+            r = http.post(
+                f"https://{host}/cs",
+                params={"id": str(random.randint(0, 0xFFFFFFFF))},
+                json=[payload],
+                timeout=TIMEOUT,
+            )
+            r.raise_for_status()
+            data = r.json()
+            if not isinstance(data, list) or not data:
+                raise RuntimeError("mega: empty api response")
+            item = data[0]
+            if isinstance(item, int):
+                raise RuntimeError(
+                    f"mega api error {item}: {_MEGA_ERRORS.get(item, 'unknown')}"
+                )
+            if "g" not in item:
+                raise RuntimeError("mega: file not accessible")
+            return item
+        except Exception as exc:  # try the next API host
+            last_exc = exc
+            log.info("mega api via %s failed: %s", host, exc)
+    raise RuntimeError(f"mega api unreachable: {last_exc}")
 
 
 def _mega_key_iv(key_b64: str) -> tuple[bytes, int]:
