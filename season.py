@@ -217,7 +217,7 @@ def pick_source(sources: dict[str, list[dict]], wanted: str) -> tuple[str, dict]
 
 
 class SeasonJob:
-    """One batch season-download job (one active batch per user; the registry
+    """One batch season-download job (one active job per user; the registry
     ACTIVE_JOBS and the `sdc|<uid>` cancel callback live in bot.py)."""
 
     def __init__(self, *, bot, chat_id: int, user_id: int, anime_title: str,
