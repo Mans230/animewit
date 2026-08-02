@@ -317,8 +317,15 @@ def _resolve_mp4_uncached(embed_url: str) -> str | None:
 # with AES-CTR.
 # ---------------------------------------------------------------------------
 # The API answers on both domains; mega.co.nz is an old alias that DNS
-# filters often forget to block.
-_MEGA_API_HOSTS = ("g.api.mega.nz", "g.api.mega.co.nz")
+# filters often forget to block. co.nz is tried first: on filtered networks
+# (e.g. Railway) only the mega.nz zone is poisoned while mega.co.nz still
+# resolves via system DNS, and the current TLS certificate on Mega's edge
+# IPs covers *.api.mega.co.nz only.
+_MEGA_API_HOSTS = ("g.api.mega.co.nz", "g.api.mega.nz")
+# Hosts that failed with a TLS hostname mismatch are remembered here and
+# skipped for the rest of the process (avoids a slow retry storm when a
+# static fallback IP serves a certificate for the wrong domain).
+_MEGA_BAD_HOSTS: set[str] = set()
 _MEGA_ERRORS = {
     -1: "internal error",
     -2: "bad arguments",
@@ -363,7 +370,9 @@ _DNS_CACHE: dict[str, str] = {}
 # Last-resort hardcoded IPs (Mega's own ranges, stable for years) for hosts
 # whose DNS is aggressively filtered; tried only when every resolver fails.
 _STATIC_IPS: dict[str, list[str]] = {
-    "g.api.mega.nz": ["66.203.125.11", "66.203.125.12", "66.203.125.13"],
+    # NOTE: no g.api.mega.nz entry — Mega's edge IPs now present a
+    # *.api.mega.co.nz certificate, so connecting to them with SNI
+    # g.api.mega.nz can never verify. g.api.mega.nz relies on real DNS.
     "g.api.mega.co.nz": ["66.203.125.11", "66.203.125.12", "66.203.125.13"],
 }
 
@@ -532,6 +541,8 @@ def _mega_api(payload: dict) -> dict:
     total failure."""
     last_exc: Exception | None = None
     for host in _MEGA_API_HOSTS:
+        if host in _MEGA_BAD_HOSTS:
+            continue  # known-broken TLS identity — don't retry every call
         try:
             http = _http_for(host)
             r = http.post(
@@ -554,6 +565,11 @@ def _mega_api(payload: dict) -> dict:
             return item
         except Exception as exc:  # try the next API host
             last_exc = exc
+            if isinstance(exc, requests.exceptions.SSLError):
+                # TLS identity mismatch (e.g. stale static IP serving the
+                # wrong certificate) — this host can't work for the rest of
+                # the process, so don't pay the retry cost on every call.
+                _MEGA_BAD_HOSTS.add(host)
             log.info("mega api via %s failed: %s", host, exc)
     raise RuntimeError(f"mega api unreachable: {last_exc}")
 
@@ -611,12 +627,21 @@ def download_mega(
         raise DownloadCancelled("mega download cancelled")
     with http.get(item["g"], stream=True, timeout=60) as r:
         r.raise_for_status()
-        with open(path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 2048):
-                if cancel is not None and cancel():
-                    raise DownloadCancelled("mega download cancelled")
-                f.write(aes.decrypt(chunk))
-                written += len(chunk)
-                if state is not None:
-                    state["done"] = written
+        if state is not None:
+            # Expose the live response so an async watchdog can force-close
+            # a stalled/throttled stream (Mega's CDN is known to slow free
+            # downloads to a trickle, which never trips the read timeout).
+            state["resp"] = r
+        try:
+            with open(path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=256 * 1024):
+                    if cancel is not None and cancel():
+                        raise DownloadCancelled("mega download cancelled")
+                    f.write(aes.decrypt(chunk))
+                    written += len(chunk)
+                    if state is not None:
+                        state["done"] = written
+        finally:
+            if state is not None:
+                state.pop("resp", None)
     return written
