@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import tempfile
+import threading
 import time
 import zipfile
 
@@ -312,7 +313,9 @@ class SeasonJob:
 
     def __init__(self, *, bot, chat_id: int, user_id: int, anime_title: str,
                  episodes: list[dict], wanted_quality: str, max_video_bytes: int,
-                 fetch_episode, too_big_reply, video_timeout: int = 3600):
+                 fetch_episode, too_big_reply, video_timeout: int = 3600,
+                 ep_timeout: float = 20 * 60, stall_secs: float = 120,
+                 watchdog_interval: float = 30):
         self.bot = bot
         self.chat_id = chat_id
         self.user_id = user_id
@@ -323,6 +326,14 @@ class SeasonJob:
         self.fetch_episode = fetch_episode        # async (ep_url) -> ep dict
         self.too_big_reply = too_big_reply        # async (ep, size) -> None
         self.video_timeout = video_timeout
+        # Per-episode watchdog: a stalled/throttled source (Mega's CDN is
+        # known to slow to a trickle without ever tripping socket timeouts)
+        # must never freeze the whole batch. `ep_timeout` is a hard wall-clock
+        # cap per episode; `stall_secs` is how long the download may go with
+        # zero byte-progress before the episode is aborted and skipped.
+        self.ep_timeout = ep_timeout
+        self.stall_secs = stall_secs
+        self.watchdog_interval = watchdog_interval
         self.cancel_event = asyncio.Event()
         self.cancel_msg = "⛔ تم إلغاء التحميل."
         # (number, status, quality, reason, src_label)
@@ -331,6 +342,7 @@ class SeasonJob:
         self.current = 0
         self.current_quality = wanted_quality
         self.current_src = ""
+        self.current_progress: tuple[int, int] | None = None  # (done, total)
         self.total = len(episodes)
 
     def cancel(self) -> None:
@@ -338,10 +350,18 @@ class SeasonJob:
 
     def build_status_text(self) -> str:
         src_part = f" | {self.current_src}" if self.current_src else ""
+        progress_part = ""
+        if self.current_progress is not None:
+            done, total = self.current_progress
+            done_mb = done / 1024 / 1024
+            if total > 0:
+                progress_part = f"\n⬇️ {done_mb:.0f} / {total / 1024 / 1024:.0f} م.ب"
+            else:
+                progress_part = f"\n⬇️ {done_mb:.0f} م.ب"
         return (
             f"📦 {self.anime_title}\n"
             f"⬇️ جاري تحميل الحلقة {self.current}/{self.total} "
-            f"(جودة {self.current_quality}{src_part})…"
+            f"(جودة {self.current_quality}{src_part})…{progress_part}"
         )
 
     def build_status_markup(self) -> InlineKeyboardMarkup:
@@ -365,6 +385,7 @@ class SeasonJob:
         okru / gofile download paths (4MB chunks, cancel checks, TooBig)."""
 
         def _stream() -> int:
+            abort = state.get("abort")  # per-episode watchdog abort event
             session = _http_session()
             with session.get(
                 url,
@@ -373,20 +394,26 @@ class SeasonJob:
                 headers={"User-Agent": resolvers.MOBILE_UA, **(headers or {})},
             ) as resp:
                 resp.raise_for_status()
-                total = int(resp.headers.get("Content-Length") or 0)
-                state["total"] = total
-                if total > self.max_video_bytes:
-                    raise TooBig(total)
-                written = 0
-                with open(path, "wb") as fh:
-                    for chunk in resp.iter_content(chunk_size=_CHUNK):
-                        if self.cancel_event.is_set():
-                            raise _DownloadCancelled()
-                        fh.write(chunk)
-                        written += len(chunk)
-                        state["done"] = written
-                        if written > self.max_video_bytes:
-                            raise TooBig(written)
+                state["resp"] = resp  # watchdog can force-close a stall
+                try:
+                    total = int(resp.headers.get("Content-Length") or 0)
+                    state["total"] = total
+                    if total > self.max_video_bytes:
+                        raise TooBig(total)
+                    written = 0
+                    with open(path, "wb") as fh:
+                        for chunk in resp.iter_content(chunk_size=_CHUNK):
+                            if self.cancel_event.is_set() or (
+                                abort is not None and abort.is_set()
+                            ):
+                                raise _DownloadCancelled()
+                            fh.write(chunk)
+                            written += len(chunk)
+                            state["done"] = written
+                            if written > self.max_video_bytes:
+                                raise TooBig(written)
+                finally:
+                    state.pop("resp", None)
             return written
 
         return _stream
@@ -441,9 +468,12 @@ class SeasonJob:
             # max_video_bytes while the file grows instead of downloading a
             # multi-GB file only to throw it away.
             oversize = {"hit": False}
+            abort = state.get("abort")  # per-episode watchdog abort event
 
             def _cancel() -> bool:
                 if self.cancel_event.is_set():
+                    return True
+                if abort is not None and abort.is_set():
                     return True
                 try:
                     if os.path.getsize(path) > self.max_video_bytes:
@@ -489,6 +519,78 @@ class SeasonJob:
             )
 
     async def _process_episode(self, i: int, ep: dict) -> None:
+        """Watchdog wrapper around `_process_episode_inner`.
+
+        Downloads run in threads that cannot be killed from the outside, and
+        some sources (Mega's free CDN) silently throttle a transfer to a
+        trickle — never raising, never finishing. Without a guard, one such
+        episode froze the whole season batch forever while the bot stayed
+        alive. Here we supervise the episode task: abort it when the download
+        makes zero byte-progress for `stall_secs`, or when the whole episode
+        exceeds `ep_timeout`, then skip to the next episode so the batch (and
+        its final summary) always completes.
+        """
+        number = str(ep.get("number", ""))
+        state: dict = {
+            "done": 0, "total": 0, "phase": "prep",
+            "abort": threading.Event(),
+        }
+        results_before = len(self.results)
+        task = asyncio.create_task(self._process_episode_inner(i, ep, state))
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.ep_timeout
+        last_done, last_change = -1, loop.time()
+        try:
+            while True:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(task), timeout=self.watchdog_interval
+                    )
+                    return  # episode finished (result appended by inner)
+                except asyncio.TimeoutError:
+                    if task.done():
+                        return
+                now = loop.time()
+                done = int(state.get("done") or 0)
+                if done != last_done:
+                    last_done, last_change = done, now
+                    self.current_progress = (done, int(state.get("total") or 0))
+                    await self._refresh_status()
+                stalled = (
+                    state.get("phase") == "download"
+                    and now - last_change > self.stall_secs
+                )
+                overtime = now >= deadline
+                if not (stalled or overtime):
+                    continue
+                reason = (
+                    "تجمّد التحميل (المصدر بطيء جدًا) — تم التخطي"
+                    if stalled
+                    else "انتهت المهلة الزمنية — تم التخطي"
+                )
+                log.warning("batch ep %s aborted: %s", number, reason)
+                state["abort"].set()
+                resp = state.get("resp")
+                if resp is not None:  # force the blocked read to raise NOW
+                    with contextlib.suppress(Exception):
+                        resp.close()
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+                # The episode may have completed (and recorded its result)
+                # in the tiny window between the stall check and the cancel
+                # — never record it twice.
+                if len(self.results) == results_before:
+                    self.results.append(
+                        (number, "failed", self.current_quality, reason,
+                         self.current_src)
+                    )
+                return
+        finally:
+            self.current_progress = None
+
+    async def _process_episode_inner(self, i: int, ep: dict,
+                                     state: dict) -> None:
         number = str(ep.get("number", ""))
         full = None
         try:
@@ -523,8 +625,9 @@ class SeasonJob:
             path = tmp.name
             tmp.close()
             try:
-                state = {"done": 0, "total": 0}
+                state["phase"] = "download"
                 size = await self._download_one(src, path, state)
+                state["phase"] = "send"
                 if size > self.max_video_bytes:
                     raise TooBig(size)
                 with open(path, "rb") as video:
@@ -540,6 +643,7 @@ class SeasonJob:
                         write_timeout=self.video_timeout,
                         filename=f"{self.anime_title} - الحلقة {number}.mp4",
                     )
+                state["phase"] = "done"
                 self.results.append((number, "sent", quality, "", src_label))
             except TooBig as tb:
                 await self.too_big_reply(full, tb.size)

@@ -158,7 +158,7 @@ class _FakeStream:
         return None
 
     def iter_content(self, chunk_size):
-        assert chunk_size == 1024 * 2048  # 2MB chunks (SPEC perf fix)
+        assert chunk_size == 256 * 1024  # 256KB chunks — fast cancel/abort reaction
         yield from self._chunks
 
 
