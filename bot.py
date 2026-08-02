@@ -71,6 +71,11 @@ FORCE_SUB_CHANNEL = os.environ.get("FORCE_SUB_CHANNEL", "").strip()
 FOLLOW_CHECK_HOURS = max(1, int(os.environ.get("FOLLOW_CHECK_HOURS", "6") or 6))
 BATCH_MAX_EPS = int(os.environ.get("BATCH_MAX_EPS", "24") or 24)
 BATCH_GLOBAL_MAX = int(os.environ.get("BATCH_GLOBAL_MAX", "2") or 2)
+# Per-episode watchdog for season batches: hard cap per episode and max
+# seconds with zero download progress before the episode is skipped (Mega's
+# CDN throttles stalled transfers without ever raising an error).
+BATCH_EP_TIMEOUT_MIN = float(os.environ.get("BATCH_EP_TIMEOUT_MIN", "20") or 20)
+BATCH_EP_STALL_SECS = float(os.environ.get("BATCH_EP_STALL_SECS", "120") or 120)
 
 # ---------------------------------------------------------------------------
 # In-memory caches (bounded, FIFO eviction)
@@ -1354,6 +1359,8 @@ async def season_go(query_obj, user_id: int, chat_id: int, tok: str, quality: st
         fetch_episode=fetch_episode,
         too_big_reply=_season_too_big_reply(chat_id, query_obj.get_bot()),
         video_timeout=VIDEO_TOTAL_TIMEOUT,
+        ep_timeout=BATCH_EP_TIMEOUT_MIN * 60,
+        stall_secs=BATCH_EP_STALL_SECS,
     )
     ACTIVE_JOBS[user_id] = job
     task = asyncio.create_task(_batch_runner(user_id, job))
