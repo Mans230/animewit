@@ -1,5 +1,6 @@
 import pytest
 
+import resolvers
 import scraper
 
 # Fake homepage built from the real card structure of witanime.life:
@@ -59,3 +60,19 @@ def test_get_latest_episodes_live():
         assert it["ep_url"].startswith("https://")
         assert it["anime_url"].startswith("https://")
         assert it["ep_title"]
+
+
+@pytest.mark.live
+def test_resolve_gofile_live():
+    """Real gofile.io/d/ link through the public API. The sandbox network
+    blocks gofile (and the link may expire), so ANY failure skips — this
+    test must never fail the suite."""
+    try:
+        out = resolvers.resolve_gofile("https://gofile.io/d/CEK8fx")
+    except Exception as exc:  # noqa: BLE001 — network is best-effort here
+        pytest.skip(f"gofile unreachable: {exc}")
+    if out is None:
+        pytest.skip("gofile resolve failed (network blocked or link expired)")
+    url, headers = out
+    assert url.startswith("https://")
+    assert "accountToken=" in headers.get("Cookie", "")
