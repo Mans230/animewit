@@ -16,6 +16,8 @@ import random
 import re
 import socket
 import struct
+import threading
+import time
 from urllib.parse import urlparse
 
 import requests
@@ -32,6 +34,63 @@ TIMEOUT = 30
 
 # ok.ru quality names ordered from best to worst
 _QUALITY_RANK = ["ultra", "quad", "full", "hd", "sd", "low", "lowest", "mobile"]
+
+
+class DownloadCancelled(Exception):
+    """Raised when a download is cancelled via its `cancel` callback."""
+
+
+# ---------------------------------------------------------------------------
+# Shared keep-alive session (SPEC perf fix): pooled connections for all
+# direct-download streaming. Lazy so importing the module never does I/O.
+# ---------------------------------------------------------------------------
+_SESSION: "requests.Session | None" = None
+_SESSION_LOCK = threading.Lock()
+
+
+def get_session() -> requests.Session:
+    """Process-wide requests.Session with an enlarged connection pool."""
+    global _SESSION
+    if _SESSION is None:
+        with _SESSION_LOCK:
+            if _SESSION is None:
+                s = requests.Session()
+                adapter = HTTPAdapter(
+                    pool_connections=8, pool_maxsize=32, max_retries=2
+                )
+                s.mount("https://", adapter)
+                s.mount("http://", adapter)
+                _SESSION = s
+    return _SESSION
+
+
+# ---------------------------------------------------------------------------
+# In-process resolve cache: successful resolutions live 6h, failures (None)
+# 10 minutes only. Keyed by the embed/preview URL.
+# ---------------------------------------------------------------------------
+_RESOLVE_CACHE: dict[str, tuple[float, "str | None"]] = {}
+_RESOLVE_CACHE_LOCK = threading.Lock()
+_CACHE_TTL_OK = 6 * 3600
+_CACHE_TTL_NONE = 10 * 60
+
+
+def _cache_get(key: str) -> "tuple[str | None, bool]":
+    """-> (value, hit). A cached None is a real hit (negative cache)."""
+    with _RESOLVE_CACHE_LOCK:
+        item = _RESOLVE_CACHE.get(key)
+        if item is None:
+            return None, False
+        ts, val = item
+        ttl = _CACHE_TTL_OK if val is not None else _CACHE_TTL_NONE
+        if time.time() - ts > ttl:
+            del _RESOLVE_CACHE[key]
+            return None, False
+        return val, True
+
+
+def _cache_put(key: str, val: "str | None") -> None:
+    with _RESOLVE_CACHE_LOCK:
+        _RESOLVE_CACHE[key] = (time.time(), val)
 
 
 def _resolve_okru(embed_url: str) -> str | None:
@@ -96,6 +155,16 @@ def _looks_like_video(headers) -> bool:
 
 
 def resolve_drive_mp4(preview_url: str) -> str | None:
+    """Cached wrapper around the drive resolver (6h TTL; None cached 10 min)."""
+    cached, hit = _cache_get(preview_url)
+    if hit:
+        return cached
+    result = _resolve_drive_mp4_uncached(preview_url)
+    _cache_put(preview_url, result)
+    return result
+
+
+def _resolve_drive_mp4_uncached(preview_url: str) -> str | None:
     """Turn a Google Drive `/file/d/{ID}/preview` URL into a direct mp4
     download URL and verify (HEAD, ranged GET fallback) that it serves video.
     Returns the direct URL or None on any failure."""
@@ -131,6 +200,16 @@ def resolve_drive_mp4(preview_url: str) -> str | None:
 
 
 def resolve_mp4(embed_url: str) -> str | None:
+    """Cached wrapper around resolve_mp4 (6h TTL; None cached 10 min)."""
+    cached, hit = _cache_get(embed_url)
+    if hit:
+        return cached
+    result = _resolve_mp4_uncached(embed_url)
+    _cache_put(embed_url, result)
+    return result
+
+
+def _resolve_mp4_uncached(embed_url: str) -> str | None:
     """Resolve an embed URL to a direct mp4 URL. Returns None if unsupported
     or on any failure (best-effort)."""
     try:
@@ -414,9 +493,16 @@ def get_mega_size(url: str) -> int | None:
         return None
 
 
-def download_mega(url: str, path: str, state: dict | None = None) -> int:
+def download_mega(
+    url: str,
+    path: str,
+    state: dict | None = None,
+    cancel=None,
+) -> int:
     """Blocking download+decrypt of a public Mega file to `path`.
     `state["done"]`/`state["total"]` are updated for progress reporting.
+    `cancel`: optional callable checked before every chunk; when it returns
+    truthy, DownloadCancelled is raised.
     Returns bytes written; raises on any failure."""
     from Crypto.Cipher import AES
     from Crypto.Util import Counter
@@ -435,10 +521,14 @@ def download_mega(url: str, path: str, state: dict | None = None) -> int:
     written = 0
     dl_host = urlparse(item["g"]).hostname
     http = _http_for(dl_host) if dl_host else requests
+    if cancel is not None and cancel():
+        raise DownloadCancelled("mega download cancelled")
     with http.get(item["g"], stream=True, timeout=60) as r:
         r.raise_for_status()
         with open(path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 512):
+            for chunk in r.iter_content(chunk_size=1024 * 2048):
+                if cancel is not None and cancel():
+                    raise DownloadCancelled("mega download cancelled")
                 f.write(aes.decrypt(chunk))
                 written += len(chunk)
                 if state is not None:
