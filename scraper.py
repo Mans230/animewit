@@ -247,6 +247,33 @@ def get_yonaplay_players(embed_url: str) -> list[dict]:
     return players
 
 
+def get_latest_episodes(limit: int = 20) -> list[dict]:
+    """Parse {BASE}/ latest-episode cards.
+
+    -> [{"ep_title", "ep_url", "anime_title", "anime_url", "screenshot"}]
+    Cards without an episode link are skipped; at most `limit` items.
+    Selectors verified live (32 cards on the homepage).
+    """
+    soup = BeautifulSoup(_get(f"{BASE}/"), "html.parser")
+    items = []
+    for card in soup.select("div.episodes-card-container"):
+        ep_a = card.select_one(".episodes-card-title h3 a")
+        if not ep_a or not ep_a.get("href"):
+            continue
+        anime_a = card.select_one(".ep-card-anime-title h3 a")
+        img = card.select_one("img.img-responsive")
+        items.append(
+            {
+                "ep_title": ep_a.get_text(strip=True),
+                "ep_url": ep_a.get("href", ""),
+                "anime_title": anime_a.get_text(strip=True) if anime_a else "",
+                "anime_url": anime_a.get("href", "") if anime_a else "",
+                "screenshot": img.get("src", "") if img else "",
+            }
+        )
+    return items[:limit]
+
+
 def get_episode(ep_url: str) -> dict:
     """-> {"title", "anime_title", "anime_url", "number",
           "prev_url": str|None, "next_url": str|None,
