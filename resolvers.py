@@ -6,6 +6,8 @@ Supported:
   quality mp4 from the videos list.
 - Google Drive: turn a `/file/d/{ID}/preview` link into the direct download
   stream at drive.usercontent.google.com and verify it serves video bytes.
+- gofile.io: public API (guest account token + /contents) -> direct link of
+  the first file plus the required accountToken Cookie header.
 """
 
 import base64
@@ -197,6 +199,90 @@ def _resolve_drive_mp4_uncached(preview_url: str) -> str | None:
     except requests.RequestException as exc:
         log.warning("drive range probe failed: %s", exc)
     return None
+
+
+# ---------------------------------------------------------------------------
+# gofile.io — public API resolver. A guest account token is created on demand
+# (POST /accounts), cached in memory and regenerated on 401/403. The content
+# endpoint returns a `children` dict; the first child of type "file" carries
+# the direct `link`. Downloading that link requires the
+# `Cookie: accountToken={token}` header, so resolve_gofile returns the header
+# dict together with the URL.
+# ---------------------------------------------------------------------------
+_GOFILE_API = "https://api.gofile.io"
+_GOFILE_WT = "4fd6sg89d7s6"  # public web token used by the gofile frontend
+_GOFILE_TOKEN: "str | None" = None
+_GOFILE_TOKEN_LOCK = threading.Lock()
+
+
+def _gofile_fresh_token() -> str:
+    """Create a guest gofile account and return its API token."""
+    resp = get_session().post(f"{_GOFILE_API}/accounts", timeout=TIMEOUT)
+    resp.raise_for_status()
+    data = resp.json()
+    token = (data.get("data") or {}).get("token") if data.get("status") == "ok" else None
+    if not token:
+        raise RuntimeError(f"gofile: account creation failed: {data.get('status')}")
+    return token
+
+
+def _gofile_token(force_refresh: bool = False) -> str:
+    global _GOFILE_TOKEN
+    with _GOFILE_TOKEN_LOCK:
+        if _GOFILE_TOKEN is None or force_refresh:
+            _GOFILE_TOKEN = _gofile_fresh_token()
+        return _GOFILE_TOKEN
+
+
+def _gofile_content(content_id: str) -> tuple[dict, str]:
+    """GET /contents/{id}; on 401/403 regenerate the token and retry once.
+    Returns (json_payload, token_used)."""
+    for attempt in range(2):
+        token = _gofile_token(force_refresh=bool(attempt))
+        resp = get_session().get(
+            f"{_GOFILE_API}/contents/{content_id}",
+            params={"wt": _GOFILE_WT, "cache": "true"},
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=TIMEOUT,
+        )
+        if resp.status_code in (401, 403) and attempt == 0:
+            log.info("gofile token rejected (%s) — refreshing", resp.status_code)
+            continue
+        resp.raise_for_status()
+        return resp.json(), token
+    raise RuntimeError("gofile: content request failed after token refresh")
+
+
+def resolve_gofile(page_url: str) -> "tuple[str, dict] | None":
+    """Resolve a gofile.io/d/{id} page URL to (direct_url, headers) for the
+    first file inside it. headers carries the required accountToken cookie.
+    Cached like the other resolvers (6h; failures 10 min). None on failure."""
+    key = f"gofile|{page_url}"
+    cached, hit = _cache_get(key)
+    if hit:
+        return cached
+    result = _resolve_gofile_uncached(page_url)
+    _cache_put(key, result)
+    return result
+
+
+def _resolve_gofile_uncached(page_url: str) -> "tuple[str, dict] | None":
+    try:
+        m = re.search(r"/d/([A-Za-z0-9]+)", page_url)
+        if not m:
+            log.warning("gofile: cannot parse content id from %s", page_url)
+            return None
+        content_id = m.group(1)
+        data, token = _gofile_content(content_id)
+        children = ((data.get("data") or {}).get("children") or {})
+        for child in children.values():
+            if child.get("type") == "file" and child.get("link"):
+                return child["link"], {"Cookie": f"accountToken={token}"}
+        log.warning("gofile: no file child in content %s", content_id)
+        return None
+    except Exception as exc:  # noqa: BLE001 — best-effort resolver
+        log.warning("resolve_gofile(%s) failed: %s", page_url, exc)
+        return None
 
 
 def resolve_mp4(embed_url: str) -> str | None:
