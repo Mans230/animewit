@@ -71,6 +71,11 @@ FORCE_SUB_CHANNEL = os.environ.get("FORCE_SUB_CHANNEL", "").strip()
 FOLLOW_CHECK_HOURS = max(1, int(os.environ.get("FOLLOW_CHECK_HOURS", "6") or 6))
 BATCH_MAX_EPS = int(os.environ.get("BATCH_MAX_EPS", "24") or 24)
 BATCH_GLOBAL_MAX = int(os.environ.get("BATCH_GLOBAL_MAX", "2") or 2)
+# Per-episode watchdog for season batches: hard cap per episode and max
+# seconds with zero download progress before the episode is skipped (Mega's
+# CDN throttles stalled transfers without ever raising an error).
+BATCH_EP_TIMEOUT_MIN = float(os.environ.get("BATCH_EP_TIMEOUT_MIN", "20") or 20)
+BATCH_EP_STALL_SECS = float(os.environ.get("BATCH_EP_STALL_SECS", "120") or 120)
 
 # ---------------------------------------------------------------------------
 # In-memory caches (bounded, FIFO eviction)
@@ -109,6 +114,11 @@ SEASON_SCAN_CACHE: "collections.OrderedDict[str, dict]" = collections.OrderedDic
 PENDING_RANGE: dict[int, tuple] = {}  # user_id -> (anime_url, first_url, first_num)
 # token -> {"first_url", "first_num", "anime_url"} for range pickers
 RANGE_TOKENS: "collections.OrderedDict[str, dict]" = collections.OrderedDict()
+# token -> retry context for the "🔁 إعادة الحلقات الفاشلة" summary button
+# {"chat_id", "message_thread_id", "user_id", "anime_title",
+#  "wanted_quality", "episodes"} — mirrored into
+# application.bot_data["failed_retries"] at post_init (same object).
+FAILED_RETRIES: "collections.OrderedDict[str, dict]" = collections.OrderedDict()
 LATEST_CACHE: dict = {"ts": 0.0, "items": []}   # 10-min cache for latest episodes
 LATEST_TTL = 600
 LATEST_PER_PAGE = 10
@@ -1330,6 +1340,33 @@ async def _batch_runner(user_id: int, job: season.SeasonJob) -> None:
             ACTIVE_JOBS.pop(user_id, None)
 
 
+def _launch_batch(bot_obj, user_id: int, chat_id: int, anime_title: str,
+                  episodes: list[dict], quality: str) -> season.SeasonJob:
+    """Create the SeasonJob (with the retry-failed summary hook), register it
+    in ACTIVE_JOBS and launch it as a background task. The caller MUST check
+    that the user has no active job first."""
+    job = season.SeasonJob(
+        bot=bot_obj,
+        chat_id=chat_id,
+        user_id=user_id,
+        anime_title=anime_title,
+        episodes=episodes,
+        wanted_quality=quality,
+        max_video_bytes=MAX_VIDEO_BYTES,
+        fetch_episode=fetch_episode,
+        too_big_reply=_season_too_big_reply(chat_id, bot_obj),
+        video_timeout=VIDEO_TOTAL_TIMEOUT,
+        ep_timeout=BATCH_EP_TIMEOUT_MIN * 60,
+        stall_secs=BATCH_EP_STALL_SECS,
+        summary_markup=_retry_failed_markup,
+    )
+    ACTIVE_JOBS[user_id] = job
+    task = asyncio.create_task(_batch_runner(user_id, job))
+    BATCH_TASKS.add(task)
+    task.add_done_callback(BATCH_TASKS.discard)
+    return job
+
+
 async def season_go(query_obj, user_id: int, chat_id: int, tok: str, quality: str) -> None:
     """'✅ ابدأ التحميل' — create the SeasonJob and launch it as a task."""
     if user_id in ACTIVE_JOBS:
@@ -1343,26 +1380,84 @@ async def season_go(query_obj, user_id: int, chat_id: int, tok: str, quality: st
         await query_obj.answer(ERR_EXPIRED, show_alert=True)
         return
     await query_obj.answer()
-    job = season.SeasonJob(
-        bot=query_obj.get_bot(),
-        chat_id=chat_id,
-        user_id=user_id,
-        anime_title=scan["title"],
-        episodes=scan["eps"],
-        wanted_quality=quality,
-        max_video_bytes=MAX_VIDEO_BYTES,
-        fetch_episode=fetch_episode,
-        too_big_reply=_season_too_big_reply(chat_id, query_obj.get_bot()),
-        video_timeout=VIDEO_TOTAL_TIMEOUT,
+    _launch_batch(
+        query_obj.get_bot(), user_id, chat_id, scan["title"], scan["eps"], quality
     )
-    ACTIVE_JOBS[user_id] = job
-    task = asyncio.create_task(_batch_runner(user_id, job))
-    BATCH_TASKS.add(task)
-    task.add_done_callback(BATCH_TASKS.discard)
     with contextlib.suppress(Exception):
         await query_obj.edit_message_text(
             f"📦 {scan['title']}\n▶️ بدأ التحميل — هتلاقي رسالة الحالة بالأسفل "
             "وفيها زر الإلغاء."
+        )
+
+
+async def _retry_failed_markup(job: season.SeasonJob) -> InlineKeyboardMarkup | None:
+    """SeasonJob summary hook: when the batch has FAILED episodes (cancelled
+    ones are NOT retried), store a retry context under a short token and
+    return a one-button markup '🔁 إعادة الحلقات الفاشلة (N)'."""
+    failed_numbers = {r[0] for r in job.results if r[1] == "failed"}
+    failed_eps = [
+        ep for ep in job.episodes
+        if str(ep.get("number", "")) in failed_numbers
+    ]
+    if not failed_eps:
+        return None
+    token = uuid.uuid4().hex[:10]  # "rf:" + 10 hex chars = 13 bytes (≤ 64)
+    _bounded_put(FAILED_RETRIES, token, {
+        "chat_id": job.chat_id,
+        "message_thread_id": None,  # batches are not topic-scoped today
+        "user_id": job.user_id,
+        "anime_title": job.anime_title,
+        "wanted_quality": job.wanted_quality,
+        "episodes": failed_eps,
+    })
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            f"🔁 إعادة الحلقات الفاشلة ({len(failed_eps)})",
+            callback_data=f"rf:{token}",
+        )
+    ]])
+
+
+async def retry_failed_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """'🔁 إعادة الحلقات الفاشلة (N)' — re-run the batch for the failed
+    episodes only, with the same quality/source options. One press = one
+    retry attempt (the token is consumed; the retry batch offers a fresh
+    button if it still has failures)."""
+    q = update.callback_query
+    user = update.effective_user
+    _touch(user)
+    if store.is_banned(user.id):
+        with contextlib.suppress(Exception):
+            await q.answer(BANNED_TEXT, show_alert=True)
+        return
+    token = (q.data or "")[len("rf:"):]
+    retries = context.bot_data.get("failed_retries")
+    if retries is None:  # bot_data not wired yet (tests / early startup)
+        retries = FAILED_RETRIES
+    ctx = retries.get(token)
+    if ctx is None:
+        await q.answer("انتهت صلاحية الزرار — اطلب التحميل من جديد", show_alert=True)
+        return
+    if user.id != ctx["user_id"]:
+        await q.answer("مش أنت صاحب التحميل ده", show_alert=True)
+        return
+    if ctx["user_id"] in ACTIVE_JOBS:
+        await q.answer(
+            "فيه تحميل شغال دلوقتي — استنى ما يخلص أو ألغِه من زر ❌",
+            show_alert=True,
+        )
+        return
+    retries.pop(token, None)
+    await q.answer("🔁 بدأت إعادة الحلقات الفاشلة…")
+    _launch_batch(
+        q.get_bot(), ctx["user_id"], ctx["chat_id"], ctx["anime_title"],
+        ctx["episodes"], ctx["wanted_quality"],
+    )
+    with contextlib.suppress(Exception):
+        await q.message.reply_text(
+            f"📦 {ctx['anime_title']}\n"
+            f"▶️ بدأت إعادة {len(ctx['episodes'])} حلقة فاشلة — "
+            "هتلاقي رسالة الحالة بالأسفل وفيها زر الإلغاء."
         )
 
 
@@ -1829,6 +1924,8 @@ class QuietServer(uvicorn.Server):
 
 
 async def post_init(application: Application) -> None:
+    # share the retry-failed token store via bot_data (same dict object)
+    application.bot_data.setdefault("failed_retries", FAILED_RETRIES)
     config = uvicorn.Config(
         build_app(WATCH_SECRET), host="0.0.0.0", port=PORT, log_level="warning"
     )
@@ -1903,6 +2000,9 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("unban", cmd_unban))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    # retry-failed button must be registered BEFORE the generic dispatcher
+    # (same group: the first matching handler wins)
+    app.add_handler(CallbackQueryHandler(retry_failed_cb, pattern=r"^rf:"))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.post_init = post_init
     app.post_shutdown = post_shutdown
