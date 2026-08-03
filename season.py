@@ -24,16 +24,11 @@ import zipfile
 
 import requests
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import RetryAfter
 
 import resolvers
 import scraper
 
 log = logging.getLogger(__name__)
-
-# Telegram flood control (429 RetryAfter) while sending batch videos: total
-# send attempts before the episode is recorded as failed.
-SEND_MAX_ATTEMPTS = int(os.environ.get("SEND_MAX_ATTEMPTS", "3") or 3)
 
 # order = best → worst (yonaplay exposes HD/FHD; gofile also ships SD)
 QUALITIES = ["FHD", "HD", "SD"]
@@ -65,35 +60,6 @@ class TooBig(Exception):
     def __init__(self, size: int):
         super().__init__(f"video too big: {size} bytes")
         self.size = size
-
-
-async def _send_with_retry(send, *, max_attempts: int | None = None,
-                           label: str = "send"):
-    """Run an async Telegram send callable with flood-control retries.
-
-    On telegram.error.RetryAfter (429) sleep `retry_after + 0.5`s and retry,
-    up to SEND_MAX_ATTEMPTS total attempts. After the last attempt the
-    RetryAfter propagates so the caller records the failure as usual. `send`
-    is a zero-arg async callable invoked once per attempt — it must rebuild
-    any consumable payload (e.g. reopen the video file) on every call.
-    """
-    attempts_allowed = max(1, max_attempts or SEND_MAX_ATTEMPTS)
-    for attempt in range(1, attempts_allowed + 1):
-        try:
-            return await send()
-        except RetryAfter as exc:
-            if attempt >= attempts_allowed:
-                raise
-            retry_after = exc.retry_after  # int seconds (timedelta in PTB v23+)
-            if hasattr(retry_after, "total_seconds"):
-                retry_after = retry_after.total_seconds()
-            delay = float(retry_after) + 0.5
-            log.warning(
-                "flood control on %s: retry in %.1fs (attempt %d/%d)",
-                label, delay, attempt, attempts_allowed,
-            )
-            await asyncio.sleep(delay)
-    return None  # pragma: no cover — unreachable (loop always returns/raises)
 
 
 # resolvers.DownloadCancelled / resolvers.get_session are added by the
@@ -349,7 +315,7 @@ class SeasonJob:
                  episodes: list[dict], wanted_quality: str, max_video_bytes: int,
                  fetch_episode, too_big_reply, video_timeout: int = 3600,
                  ep_timeout: float = 20 * 60, stall_secs: float = 120,
-                 watchdog_interval: float = 30, summary_markup=None):
+                 watchdog_interval: float = 30):
         self.bot = bot
         self.chat_id = chat_id
         self.user_id = user_id
@@ -368,16 +334,11 @@ class SeasonJob:
         self.ep_timeout = ep_timeout
         self.stall_secs = stall_secs
         self.watchdog_interval = watchdog_interval
-        # Optional async hook (job) -> InlineKeyboardMarkup | None, called
-        # just before the final summary is sent (bot.py uses it to attach the
-        # "🔁 retry failed episodes" button when the batch has failures).
-        self.summary_markup = summary_markup
         self.cancel_event = asyncio.Event()
         self.cancel_msg = "⛔ تم إلغاء التحميل."
         # (number, status, quality, reason, src_label)
         self.results: list[tuple[str, str, str, str, str]] = []
         self.status_msg = None
-        self.summary_message = None
         self.current = 0
         self.current_quality = wanted_quality
         self.current_src = ""
@@ -669,25 +630,19 @@ class SeasonJob:
                 state["phase"] = "send"
                 if size > self.max_video_bytes:
                     raise TooBig(size)
-
-                async def _send_video():
-                    # reopen per attempt: a RetryAfter may hit mid-upload,
-                    # leaving the previous file object partially consumed
-                    with open(path, "rb") as video:
-                        return await self.bot.send_video(
-                            chat_id=self.chat_id,
-                            video=video,
-                            caption=(
-                                f"🎬 {self.anime_title} — الحلقة {number}\n"
-                                f"📦 {i}/{self.total} | جودة {quality} | {src_label}"
-                            ),
-                            supports_streaming=True,
-                            read_timeout=self.video_timeout,
-                            write_timeout=self.video_timeout,
-                            filename=f"{self.anime_title} - الحلقة {number}.mp4",
-                        )
-
-                await _send_with_retry(_send_video, label=f"ep {number} video")
+                with open(path, "rb") as video:
+                    await self.bot.send_video(
+                        chat_id=self.chat_id,
+                        video=video,
+                        caption=(
+                            f"🎬 {self.anime_title} — الحلقة {number}\n"
+                            f"📦 {i}/{self.total} | جودة {quality} | {src_label}"
+                        ),
+                        supports_streaming=True,
+                        read_timeout=self.video_timeout,
+                        write_timeout=self.video_timeout,
+                        filename=f"{self.anime_title} - الحلقة {number}.mp4",
+                    )
                 state["phase"] = "done"
                 self.results.append((number, "sent", quality, "", src_label))
             except TooBig as tb:
@@ -773,17 +728,9 @@ class SeasonJob:
                     reply_markup=InlineKeyboardMarkup([]),  # clear the cancel button
                 )
         try:
-            markup = None
-            if self.summary_markup is not None:
-                try:
-                    markup = await self.summary_markup(self)
-                except Exception:  # noqa: BLE001 — never lose the summary
-                    log.exception("batch: summary markup hook failed")
-                    markup = None
-            self.summary_message = await self.bot.send_message(
+            await self.bot.send_message(
                 chat_id=self.chat_id,
                 text=self.build_summary_text(),
-                reply_markup=markup,
             )
         except Exception:  # noqa: BLE001
             log.exception("batch: final summary failed")
