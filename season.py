@@ -1,12 +1,10 @@
 """Batch season-download engine (SPEC.md §Module: season.py).
 
 Sends a whole season (or a range of episodes) into Telegram one video after
-another, from any available source: Google Drive / Mega (expanded from the
-yonaplay players of each episode), ok.ru watch servers and official gofile
-download links (ZIP files whose video is auto-extracted). Supports instant
-cancel, per-episode TooBig fallback (direct-download links instead),
-nearest-quality substitution and a detailed final Arabic summary (always
-sent, even on cancel).
+another, using Google Drive / Mega sources only (expanded from the yonaplay
+players of each episode). Supports instant cancel, per-episode TooBig
+fallback (direct-download links instead), nearest-quality substitution and a
+detailed final Arabic summary (always sent, even on cancel).
 
 This module must NOT import bot.py — the job registry lives there.
 """
@@ -16,11 +14,8 @@ import collections
 import contextlib
 import logging
 import os
-import re
 import tempfile
-import threading
 import time
-import zipfile
 
 import requests
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -30,17 +25,9 @@ import scraper
 
 log = logging.getLogger(__name__)
 
-# order = best → worst (yonaplay exposes HD/FHD; gofile also ships SD)
-QUALITIES = ["FHD", "HD", "SD"]
-PREFER_HOST = {"drive": 0, "mega": 1, "okru": 2, "gofile": 3}
-
-# user-facing Arabic labels per source kind
-SRC_LABELS = {
-    "drive": "Google Drive",
-    "mega": "Mega",
-    "okru": "ok.ru",
-    "gofile": "gofile (ZIP)",
-}
+# yonaplay players expose HD/FHD only — order = best → worst
+QUALITIES = ["FHD", "HD"]
+PREFER_HOST = {"drive": 0, "mega": 1}
 
 _CACHE_TTL = 6 * 3600          # 6h resolve cache
 _CACHE_MAX = 500               # max cached episodes
@@ -88,36 +75,13 @@ def _src_kind(url: str, host: str) -> str | None:
     return None
 
 
-def _is_okru(name: str, embed_url: str) -> bool:
-    low = f"{name} {embed_url}".lower()
-    return "ok.ru" in low or "odnoklassniki" in low
-
-
-def _server_name_quality(name: str) -> str:
-    """ok.ru servers carry their quality as a suffix ('ok.ru - FHD');
-    no suffix means HD."""
-    m = re.search(r"-\s*(FHD|HD|SD)\s*$", name, re.IGNORECASE)
-    return m.group(1).upper() if m else "HD"
-
-
-def _download_label_quality(label: str) -> str | None:
-    """Extract the quality from an Arabic download label such as
-    'الجودة المتوسطة SD' — FHD must be tested before HD (substring)."""
-    m = re.search(r"(FHD|HD|SD)", label, re.IGNORECASE)
-    return m.group(1).upper() if m else None
-
-
 async def episode_quality_sources(ep: dict) -> dict[str, list[dict]]:
-    """-> {"FHD": [{"kind": "drive"|"mega"|"okru"|"gofile", "url", "host"}], ...}
+    """-> {"FHD": [{"kind": "drive"|"mega", "url": str, "host": str}], "HD": [...]}
 
-    Sources: drive/mega from the yonaplay players of the episode, ok.ru watch
-    servers (quality from the server-name suffix, HD by default) and gofile
-    official download links (quality from the Arabic label; the ZIP is
-    auto-extracted at download time). Other hosts (4shared/dotplay/
-    mediafire/workupload/send...) stay manual-link only. Deduped, host-sorted
-    (drive first). yonaplay servers are expanded via
-    scraper.get_yonaplay_players (in a thread). Results are cached in a 6h
-    TTL OrderedDict cache (max 500 entries).
+    Drive + Mega ONLY (4shared/dotplay/ok.ru excluded from batch), deduped,
+    host-sorted (drive first). Expands ALL yonaplay servers of the episode
+    via scraper.get_yonaplay_players (in a thread). Results are cached in a
+    6h TTL OrderedDict cache (max 500 entries).
     """
     key = _ep_cache_key(ep)
     now = time.time()
@@ -131,23 +95,11 @@ async def episode_quality_sources(ep: dict) -> dict[str, list[dict]]:
 
     sources: dict[str, list[dict]] = {q: [] for q in QUALITIES}
     seen: set[tuple[str, str]] = set()
-
-    def _add(quality: str, kind: str, url: str, host: str) -> None:
-        if quality not in QUALITIES or not url or (quality, url) in seen:
-            return
-        seen.add((quality, url))
-        sources[quality].append({"kind": kind, "url": url, "host": host})
-
     for server in ep.get("servers") or []:
-        name = server.get("name") or ""
+        if "yonaplay" not in (server.get("name") or "").lower():
+            continue
         embed_url = server.get("embed_url") or ""
         if not embed_url:
-            continue
-        # ok.ru / odnoklassniki watch servers resolve directly to mp4
-        if _is_okru(name, embed_url):
-            _add(_server_name_quality(name), "okru", embed_url, "ok.ru")
-            continue
-        if "yonaplay" not in name.lower():
             continue
         try:
             players = await asyncio.to_thread(
@@ -158,18 +110,16 @@ async def episode_quality_sources(ep: dict) -> dict[str, list[dict]]:
             continue
         for player in players:
             quality = player.get("quality") or ""
-            kind = _src_kind(player.get("url") or "", player.get("host") or "")
-            if kind:
-                _add(quality, kind, player.get("url") or "", player.get("host") or "")
-
-    # official gofile download links (ZIPs auto-extracted at download time)
-    for dl in ep.get("downloads") or []:
-        if "gofile" not in (dl.get("host") or "").lower():
-            continue
-        quality = _download_label_quality(dl.get("quality") or "")
-        if quality:  # unknown-quality labels are ignored
-            _add(quality, "gofile", dl.get("url") or "", "gofile")
-
+            if quality not in QUALITIES:
+                continue
+            url = player.get("url") or ""
+            kind = _src_kind(url, player.get("host") or "")
+            if not kind or (quality, url) in seen:
+                continue
+            seen.add((quality, url))
+            sources[quality].append(
+                {"kind": kind, "url": url, "host": player.get("host") or ""}
+            )
     for quality in sources:
         sources[quality].sort(key=lambda s: PREFER_HOST.get(s["kind"], 9))
 
@@ -266,56 +216,13 @@ def pick_source(sources: dict[str, list[dict]], wanted: str) -> tuple[str, dict]
     return quality, sources[quality][0]
 
 
-_VIDEO_EXTS = (".mp4", ".mkv", ".avi")
-
-
-def _extract_video(zip_path: str) -> str | None:
-    """Extract the biggest video entry (.mp4/.mkv/.avi) of a gofile ZIP into
-    a new temp file and return its path (caller owns cleanup). Returns None
-    when the archive has no video or is corrupt."""
-    try:
-        with zipfile.ZipFile(zip_path) as zf:
-            entries = [
-                info
-                for info in zf.infolist()
-                if not info.is_dir()
-                and info.filename.lower().endswith(_VIDEO_EXTS)
-            ]
-            if not entries:
-                log.warning("gofile zip has no video entry: %s", zip_path)
-                return None
-            biggest = max(entries, key=lambda info: info.file_size)
-            ext = os.path.splitext(biggest.filename)[1] or ".mp4"
-            tmp = tempfile.NamedTemporaryFile(
-                prefix="witanime-gofile-", suffix=ext, delete=False
-            )
-            out_path = tmp.name
-            try:
-                with tmp, zf.open(biggest) as src_fh:
-                    while True:
-                        chunk = src_fh.read(_CHUNK)
-                        if not chunk:
-                            break
-                        tmp.write(chunk)
-            except Exception:
-                with contextlib.suppress(OSError):
-                    os.unlink(out_path)
-                raise
-            return out_path
-    except Exception as exc:  # noqa: BLE001 — BadZipFile/OSError/... → None
-        log.warning("gofile zip extract failed (%s): %s", zip_path, exc)
-        return None
-
-
 class SeasonJob:
     """One batch season-download job (one active job per user; the registry
     ACTIVE_JOBS and the `sdc|<uid>` cancel callback live in bot.py)."""
 
     def __init__(self, *, bot, chat_id: int, user_id: int, anime_title: str,
                  episodes: list[dict], wanted_quality: str, max_video_bytes: int,
-                 fetch_episode, too_big_reply, video_timeout: int = 3600,
-                 ep_timeout: float = 20 * 60, stall_secs: float = 120,
-                 watchdog_interval: float = 30):
+                 fetch_episode, too_big_reply, video_timeout: int = 3600):
         self.bot = bot
         self.chat_id = chat_id
         self.user_id = user_id
@@ -326,42 +233,22 @@ class SeasonJob:
         self.fetch_episode = fetch_episode        # async (ep_url) -> ep dict
         self.too_big_reply = too_big_reply        # async (ep, size) -> None
         self.video_timeout = video_timeout
-        # Per-episode watchdog: a stalled/throttled source (Mega's CDN is
-        # known to slow to a trickle without ever tripping socket timeouts)
-        # must never freeze the whole batch. `ep_timeout` is a hard wall-clock
-        # cap per episode; `stall_secs` is how long the download may go with
-        # zero byte-progress before the episode is aborted and skipped.
-        self.ep_timeout = ep_timeout
-        self.stall_secs = stall_secs
-        self.watchdog_interval = watchdog_interval
         self.cancel_event = asyncio.Event()
         self.cancel_msg = "⛔ تم إلغاء التحميل."
-        # (number, status, quality, reason, src_label)
-        self.results: list[tuple[str, str, str, str, str]] = []
+        self.results: list[tuple[str, str, str, str]] = []  # (number, status, quality, reason)
         self.status_msg = None
         self.current = 0
         self.current_quality = wanted_quality
-        self.current_src = ""
-        self.current_progress: tuple[int, int] | None = None  # (done, total)
         self.total = len(episodes)
 
     def cancel(self) -> None:
         self.cancel_event.set()
 
     def build_status_text(self) -> str:
-        src_part = f" | {self.current_src}" if self.current_src else ""
-        progress_part = ""
-        if self.current_progress is not None:
-            done, total = self.current_progress
-            done_mb = done / 1024 / 1024
-            if total > 0:
-                progress_part = f"\n⬇️ {done_mb:.0f} / {total / 1024 / 1024:.0f} م.ب"
-            else:
-                progress_part = f"\n⬇️ {done_mb:.0f} م.ب"
         return (
             f"📦 {self.anime_title}\n"
             f"⬇️ جاري تحميل الحلقة {self.current}/{self.total} "
-            f"(جودة {self.current_quality}{src_part})…{progress_part}"
+            f"(جودة {self.current_quality})…"
         )
 
     def build_status_markup(self) -> InlineKeyboardMarkup:
@@ -379,88 +266,10 @@ class SeasonJob:
                 reply_markup=self.build_status_markup(),
             )
 
-    def _stream_to(self, url: str, path: str, state: dict,
-                   headers: dict | None = None) -> "callable":
-        """Build the blocking stream-to-file worker shared by the drive /
-        okru / gofile download paths (4MB chunks, cancel checks, TooBig)."""
-
-        def _stream() -> int:
-            abort = state.get("abort")  # per-episode watchdog abort event
-            session = _http_session()
-            with session.get(
-                url,
-                stream=True,
-                timeout=60,
-                headers={"User-Agent": resolvers.MOBILE_UA, **(headers or {})},
-            ) as resp:
-                resp.raise_for_status()
-                state["resp"] = resp  # watchdog can force-close a stall
-                try:
-                    total = int(resp.headers.get("Content-Length") or 0)
-                    state["total"] = total
-                    if total > self.max_video_bytes:
-                        raise TooBig(total)
-                    written = 0
-                    with open(path, "wb") as fh:
-                        for chunk in resp.iter_content(chunk_size=_CHUNK):
-                            if self.cancel_event.is_set() or (
-                                abort is not None and abort.is_set()
-                            ):
-                                raise _DownloadCancelled()
-                            fh.write(chunk)
-                            written += len(chunk)
-                            state["done"] = written
-                            if written > self.max_video_bytes:
-                                raise TooBig(written)
-                finally:
-                    state.pop("resp", None)
-            return written
-
-        return _stream
-
-    async def _download_gofile(self, src: dict, path: str, state: dict) -> int:
-        """gofile: resolve to a direct ZIP link, stream the ZIP to a temp
-        file (max_video_bytes enforced on the ZIP itself), extract its
-        biggest video, delete the ZIP immediately, enforce the size limit on
-        the extracted video and move it onto `path`."""
-        resolved = await asyncio.to_thread(resolvers.resolve_gofile, src["url"])
-        if not resolved:
-            raise RuntimeError("تعذر استخراج رابط مباشر من gofile")
-        direct_url, headers = resolved
-
-        zip_fd, zip_path = tempfile.mkstemp(
-            prefix="witanime-gofile-", suffix=".zip"
-        )
-        os.close(zip_fd)
-        try:
-            await asyncio.to_thread(
-                self._stream_to(direct_url, zip_path, state, headers)
-            )
-            extracted = await asyncio.to_thread(_extract_video, zip_path)
-        finally:
-            with contextlib.suppress(OSError):  # the ZIP never outlives this
-                os.unlink(zip_path)
-        if not extracted:
-            raise RuntimeError("ملف gofile لا يحتوي على فيديو")
-        try:
-            size = os.path.getsize(extracted)
-            if size > self.max_video_bytes:
-                raise TooBig(size)
-            os.replace(extracted, path)  # same temp dir → atomic rename
-        except Exception:
-            with contextlib.suppress(OSError):
-                os.unlink(extracted)
-            raise
-        state["total"] = size
-        state["done"] = size
-        return size
-
     async def _download_one(self, src: dict, path: str, state: dict) -> int:
         """Download one source into `path`. Returns bytes written.
         Drive → resolve_drive_mp4 then stream via resolvers.get_session()
-        (4MB chunks); ok.ru → resolve_mp4 then the same stream path;
-        Mega → resolvers.download_mega(..., cancel=...);
-        gofile → resolve_gofile + ZIP auto-extract (_download_gofile).
+        (4MB chunks); Mega → resolvers.download_mega(..., cancel=...).
         Checks self.cancel_event per chunk → DownloadCancelled; enforces
         max_video_bytes → TooBig."""
         if src["kind"] == "mega":
@@ -468,12 +277,9 @@ class SeasonJob:
             # max_video_bytes while the file grows instead of downloading a
             # multi-GB file only to throw it away.
             oversize = {"hit": False}
-            abort = state.get("abort")  # per-episode watchdog abort event
 
             def _cancel() -> bool:
                 if self.cancel_event.is_set():
-                    return True
-                if abort is not None and abort.is_set():
                     return True
                 try:
                     if os.path.getsize(path) > self.max_video_bytes:
@@ -497,100 +303,44 @@ class SeasonJob:
                     raise TooBig(oversize_size)
                 raise
 
-        if src["kind"] == "gofile":
-            return await self._download_gofile(src, path, state)
-
-        # drive + okru share the resolve-then-stream path
-        if src["kind"] == "okru":
-            mp4_url = await asyncio.to_thread(resolvers.resolve_mp4, src["url"])
-            fail_msg = "تعذر استخراج رابط مباشر من ok.ru"
-        else:
-            mp4_url = await asyncio.to_thread(resolvers.resolve_drive_mp4, src["url"])
-            fail_msg = "تعذر استخراج رابط مباشر من Google Drive"
+        mp4_url = await asyncio.to_thread(resolvers.resolve_drive_mp4, src["url"])
         if not mp4_url:
-            raise RuntimeError(fail_msg)
+            raise RuntimeError("تعذر استخراج رابط مباشر من Google Drive")
 
-        return await asyncio.to_thread(self._stream_to(mp4_url, path, state))
+        def _stream() -> int:
+            session = _http_session()
+            with session.get(
+                mp4_url,
+                stream=True,
+                timeout=60,
+                headers={"User-Agent": resolvers.MOBILE_UA},
+            ) as resp:
+                resp.raise_for_status()
+                total = int(resp.headers.get("Content-Length") or 0)
+                state["total"] = total
+                if total > self.max_video_bytes:
+                    raise TooBig(total)
+                written = 0
+                with open(path, "wb") as fh:
+                    for chunk in resp.iter_content(chunk_size=_CHUNK):
+                        if self.cancel_event.is_set():
+                            raise _DownloadCancelled()
+                        fh.write(chunk)
+                        written += len(chunk)
+                        state["done"] = written
+                        if written > self.max_video_bytes:
+                            raise TooBig(written)
+            return written
+
+        return await asyncio.to_thread(_stream)
 
     def _mark_remaining_cancelled(self, start: int) -> None:
         for ep in self.episodes[start:]:
             self.results.append(
-                (str(ep.get("number", "")), "cancelled", "", self.cancel_msg, "")
+                (str(ep.get("number", "")), "cancelled", "", self.cancel_msg)
             )
 
     async def _process_episode(self, i: int, ep: dict) -> None:
-        """Watchdog wrapper around `_process_episode_inner`.
-
-        Downloads run in threads that cannot be killed from the outside, and
-        some sources (Mega's free CDN) silently throttle a transfer to a
-        trickle — never raising, never finishing. Without a guard, one such
-        episode froze the whole season batch forever while the bot stayed
-        alive. Here we supervise the episode task: abort it when the download
-        makes zero byte-progress for `stall_secs`, or when the whole episode
-        exceeds `ep_timeout`, then skip to the next episode so the batch (and
-        its final summary) always completes.
-        """
-        number = str(ep.get("number", ""))
-        state: dict = {
-            "done": 0, "total": 0, "phase": "prep",
-            "abort": threading.Event(),
-        }
-        results_before = len(self.results)
-        task = asyncio.create_task(self._process_episode_inner(i, ep, state))
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + self.ep_timeout
-        last_done, last_change = -1, loop.time()
-        try:
-            while True:
-                try:
-                    await asyncio.wait_for(
-                        asyncio.shield(task), timeout=self.watchdog_interval
-                    )
-                    return  # episode finished (result appended by inner)
-                except asyncio.TimeoutError:
-                    if task.done():
-                        return
-                now = loop.time()
-                done = int(state.get("done") or 0)
-                if done != last_done:
-                    last_done, last_change = done, now
-                    self.current_progress = (done, int(state.get("total") or 0))
-                    await self._refresh_status()
-                stalled = (
-                    state.get("phase") == "download"
-                    and now - last_change > self.stall_secs
-                )
-                overtime = now >= deadline
-                if not (stalled or overtime):
-                    continue
-                reason = (
-                    "تجمّد التحميل (المصدر بطيء جدًا) — تم التخطي"
-                    if stalled
-                    else "انتهت المهلة الزمنية — تم التخطي"
-                )
-                log.warning("batch ep %s aborted: %s", number, reason)
-                state["abort"].set()
-                resp = state.get("resp")
-                if resp is not None:  # force the blocked read to raise NOW
-                    with contextlib.suppress(Exception):
-                        resp.close()
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
-                # The episode may have completed (and recorded its result)
-                # in the tiny window between the stall check and the cancel
-                # — never record it twice.
-                if len(self.results) == results_before:
-                    self.results.append(
-                        (number, "failed", self.current_quality, reason,
-                         self.current_src)
-                    )
-                return
-        finally:
-            self.current_progress = None
-
-    async def _process_episode_inner(self, i: int, ep: dict,
-                                     state: dict) -> None:
         number = str(ep.get("number", ""))
         full = None
         try:
@@ -600,13 +350,11 @@ class SeasonJob:
             picked = pick_source(sources, self.wanted_quality)
             if not picked:
                 self.results.append(
-                    (number, "failed", "", "لا توجد جودة مناسبة", "")
+                    (number, "failed", "", "لا توجد جودة مناسبة")
                 )
                 return
             quality, src = picked
             self.current_quality = quality
-            src_label = SRC_LABELS.get(src["kind"], src["kind"])
-            self.current_src = src_label
 
             if src["kind"] == "mega":
                 # cheap remote size guard before starting the real download
@@ -614,8 +362,7 @@ class SeasonJob:
                 if size and size > self.max_video_bytes:
                     await self.too_big_reply(full, size)
                     self.results.append(
-                        (number, "links", quality,
-                         "الحجم أكبر من الحد المسموح", src_label)
+                        (number, "links", quality, "الحجم أكبر من الحد المسموح")
                     )
                     return
 
@@ -625,9 +372,8 @@ class SeasonJob:
             path = tmp.name
             tmp.close()
             try:
-                state["phase"] = "download"
+                state = {"done": 0, "total": 0}
                 size = await self._download_one(src, path, state)
-                state["phase"] = "send"
                 if size > self.max_video_bytes:
                     raise TooBig(size)
                 with open(path, "rb") as video:
@@ -636,57 +382,53 @@ class SeasonJob:
                         video=video,
                         caption=(
                             f"🎬 {self.anime_title} — الحلقة {number}\n"
-                            f"📦 {i}/{self.total} | جودة {quality} | {src_label}"
+                            f"📦 {i}/{self.total} | جودة {quality}"
                         ),
                         supports_streaming=True,
                         read_timeout=self.video_timeout,
                         write_timeout=self.video_timeout,
                         filename=f"{self.anime_title} - الحلقة {number}.mp4",
                     )
-                state["phase"] = "done"
-                self.results.append((number, "sent", quality, "", src_label))
+                self.results.append((number, "sent", quality, ""))
             except TooBig as tb:
                 await self.too_big_reply(full, tb.size)
                 self.results.append(
-                    (number, "links", quality,
-                     "الحجم أكبر من الحد المسموح", src_label)
+                    (number, "links", quality, "الحجم أكبر من الحد المسموح")
                 )
             except _DownloadCancelled:
                 self.results.append(
-                    (number, "cancelled", quality, self.cancel_msg, src_label)
+                    (number, "cancelled", quality, self.cancel_msg)
                 )
             except Exception as exc:  # noqa: BLE001 — keep the batch going
                 log.warning("batch ep %s failed: %s", number, exc)
                 self.results.append(
-                    (number, "failed", quality,
-                     str(exc) or "خطأ غير معروف", src_label)
+                    (number, "failed", quality, str(exc) or "خطأ غير معروف")
                 )
             finally:
                 with contextlib.suppress(OSError):
                     os.unlink(path)
         except _DownloadCancelled:
-            self.results.append((number, "cancelled", "", self.cancel_msg, ""))
+            self.results.append((number, "cancelled", "", self.cancel_msg))
         except Exception as exc:  # noqa: BLE001 — fetch/sources failure
             log.warning("batch ep %s failed early: %s", number, exc)
             self.results.append(
-                (number, "failed", "", str(exc) or "خطأ غير معروف", "")
+                (number, "failed", "", str(exc) or "خطأ غير معروف")
             )
 
     def build_summary_text(self) -> str:
         icons = {"sent": "✅", "links": "🔗", "failed": "❌", "cancelled": "⛔"}
         labels = {
-            "sent": lambda q, r, s: f"أُرسلت (جودة {q} | {s})",
-            "links": lambda q, r, s: f"أُرسلت روابط التحميل المباشر (جودة {q} | {s})",
-            "failed": lambda q, r, s: f"فشلت — {r}",
-            "cancelled": lambda q, r, s: "أُلغيت",
+            "sent": lambda q, r: f"أُرسلت (جودة {q})",
+            "links": lambda q, r: f"أُرسلت روابط التحميل المباشر (جودة {q})",
+            "failed": lambda q, r: f"فشلت — {r}",
+            "cancelled": lambda q, r: "أُلغيت",
         }
         lines = [f"📦 {self.anime_title} — ملخص تحميل الموسم", ""]
         tally = {"sent": 0, "links": 0, "failed": 0, "cancelled": 0}
-        for number, status, quality, reason, src_label in self.results:
+        for number, status, quality, reason in self.results:
             tally[status] = tally.get(status, 0) + 1
             lines.append(
-                f"{icons[status]} الحلقة {number}: "
-                f"{labels[status](quality, reason, src_label)}"
+                f"{icons[status]} الحلقة {number}: {labels[status](quality, reason)}"
             )
         lines.append("")
         lines.append(

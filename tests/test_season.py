@@ -4,12 +4,8 @@ Everything is mocked: no live network (mega.nz is blocked from this sandbox
 anyway). Run: python -m pytest -q tests/test_season.py
 """
 
-import glob
-import io
 import os
 import sys
-import tempfile
-import zipfile
 
 import pytest
 
@@ -47,13 +43,8 @@ def mega_src(quality="HD", fid="MID"):
     }
 
 
-def make_ep(number, embed_url=None, *, okru=False, downloads=None):
+def make_ep(number, embed_url=None):
     embed_url = embed_url or f"https://yona.example/embed/{number}"
-    servers = [{"name": "yonaplay - multi", "embed_url": embed_url}]
-    if okru:
-        servers.append(
-            {"name": "ok.ru", "embed_url": f"https://ok.ru/videoembed/{number}"}
-        )
     return {
         "title": f"Test Anime الحلقة {number}",
         "anime_title": "Test Anime",
@@ -63,8 +54,11 @@ def make_ep(number, embed_url=None, *, okru=False, downloads=None):
         "type": "حلقة",
         "prev_url": None,
         "next_url": None,
-        "servers": servers,
-        "downloads": downloads or [],
+        "servers": [
+            {"name": "yonaplay - multi", "embed_url": embed_url},
+            {"name": "ok.ru", "embed_url": "https://ok.ru/videoembed/1"},
+        ],
+        "downloads": [],
     }
 
 
@@ -187,10 +181,7 @@ def make_job(bot, episodes, *, wanted="HD", max_bytes=10 * 1024 * 1024,
         (["HD"], "FHD", "HD"),           # wanted missing -> worse quality
         ([], "FHD", None),               # empty
         ([], "HD", None),                # empty
-        (["SD"], "FHD", "SD"),           # SD is a real quality now
-        (["SD"], "HD", "SD"),            # only worse available
-        (["SD", "HD"], "FHD", "HD"),     # nearest below FHD
-        (["SD", "FHD"], "HD", "FHD"),    # nearest above HD
+        (["SD"], "FHD", None),           # unknown qualities only
     ],
 )
 def test_nearest_quality_matrix(available, wanted, expected):
@@ -282,7 +273,7 @@ async def test_scan_season_counts_truncate_sort(monkeypatch):
     assert result["truncated"] is True
     assert result["total"] == 5
     assert [e["number"] for e in result["eps"]] == ["1", "2", "3"]  # sorted + capped
-    assert result["counts"] == {"FHD": 1, "HD": 2, "SD": 0}
+    assert result["counts"] == {"FHD": 1, "HD": 2}
     ep1 = result["eps"][0]
     assert ep1["sources"]["FHD"][0]["kind"] == "drive"
 
@@ -301,7 +292,7 @@ async def test_scan_season_no_truncation(monkeypatch):
     )
     assert result["truncated"] is False
     assert result["total"] == 1
-    assert result["counts"] == {"FHD": 0, "HD": 1, "SD": 0}
+    assert result["counts"] == {"FHD": 0, "HD": 1}
 
 
 # ---------------------------------------------------------------------------
@@ -455,8 +446,7 @@ async def test_job_missing_quality_uses_nearest(monkeypatch):
 
     assert len(bot.sent_videos) == 1
     assert "جودة HD" in bot.sent_videos[0]["caption"]
-    assert "Google Drive" in bot.sent_videos[0]["caption"]
-    assert job.results == [("7", "sent", "HD", "", "Google Drive")]
+    assert job.results == [("7", "sent", "HD", "")]
 
 
 @pytest.mark.asyncio
@@ -532,6 +522,7 @@ async def test_job_mega_inflight_oversize_marks_links(monkeypatch):
     bot = FakeBot()
     job = make_job(bot, [
         {"number": "1", "url": "https://witanime.example/ep-1", "type": "حلقة"},
+
     ], max_bytes=1024, too_big_calls=too_big_calls)
     await job.run()
 
@@ -564,284 +555,3 @@ def test_status_markup_cancel_button():
     assert btn.text == "❌ إلغاء التحميل"
     assert btn.callback_data == "sdc|42"
     assert len(btn.callback_data.encode()) <= 64
-
-
-# ---------------------------------------------------------------------------
-# any-source expansion: ok.ru servers + gofile downloads (+ SD quality)
-# ---------------------------------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_episode_quality_sources_gofile_arabic_quality_map(monkeypatch):
-    patch_players(monkeypatch, {})
-    ep = make_ep(1, downloads=[
-        {"quality": "الجودة الخارقة FHD", "host": "gofile",
-         "url": "https://gofile.io/d/FHD1"},
-        {"quality": "الجودة العالية HD", "host": "gofile",
-         "url": "https://gofile.io/d/HD1"},
-        {"quality": "الجودة المتوسطة SD", "host": "gofile",
-         "url": "https://gofile.io/d/SD1"},
-        {"quality": "جودة غير معروفة", "host": "gofile",
-         "url": "https://gofile.io/d/UNK"},  # unknown quality -> ignored
-        {"quality": "الجودة العالية HD", "host": "mediafire",
-         "url": "https://mediafire.example/x"},  # non-gofile host -> ignored
-        {"quality": "الجودة العالية HD", "host": "gofile",
-         "url": "https://gofile.io/d/HD1"},  # duplicate -> deduped
-    ])
-    sources = await season.episode_quality_sources(ep)
-    assert [s["url"] for s in sources["FHD"]] == ["https://gofile.io/d/FHD1"]
-    assert [s["url"] for s in sources["HD"]] == ["https://gofile.io/d/HD1"]
-    assert [s["url"] for s in sources["SD"]] == ["https://gofile.io/d/SD1"]
-    assert all(
-        s["kind"] == "gofile" and s["host"] == "gofile"
-        for srcs in sources.values() for s in srcs
-    )
-
-
-@pytest.mark.asyncio
-async def test_episode_quality_sources_okru_suffix_quality(monkeypatch):
-    patch_players(monkeypatch, {})
-    ep = make_ep(1)
-    ep["servers"] = [
-        {"name": "ok.ru", "embed_url": "https://ok.ru/videoembed/AAA"},
-        {"name": "ok.ru - FHD", "embed_url": "https://ok.ru/videoembed/BBB"},
-        # matched via the embed URL, no suffix -> HD
-        {"name": "odnoklassniki", "embed_url": "https://ok.ru/videoembed/CCC"},
-        {"name": "ok.ru", "embed_url": "https://ok.ru/videoembed/AAA"},  # dup
-    ]
-    sources = await season.episode_quality_sources(ep)
-    assert [s["url"] for s in sources["FHD"]] == ["https://ok.ru/videoembed/BBB"]
-    assert sorted(s["url"] for s in sources["HD"]) == [
-        "https://ok.ru/videoembed/AAA",
-        "https://ok.ru/videoembed/CCC",
-    ]
-    assert all(
-        s["kind"] == "okru" and s["host"] == "ok.ru"
-        for srcs in sources.values() for s in srcs
-    )
-
-
-@pytest.mark.asyncio
-async def test_episode_quality_sources_host_priority(monkeypatch):
-    embed = "https://yona.example/embed/1"
-    # mega listed before drive on purpose — the sort must prefer drive
-    patch_players(monkeypatch, {embed: [mega_src("HD"), drive_src("HD")]})
-    ep = make_ep(1, embed, okru=True, downloads=[
-        {"quality": "الجودة العالية HD", "host": "gofile",
-         "url": "https://gofile.io/d/HD1"},
-    ])
-    sources = await season.episode_quality_sources(ep)
-    assert [s["kind"] for s in sources["HD"]] == ["drive", "mega", "okru", "gofile"]
-    quality, src = season.pick_source(sources, "HD")
-    assert quality == "HD"
-    assert src["kind"] == "drive"
-
-
-@pytest.mark.asyncio
-async def test_scan_season_sd_counted(monkeypatch):
-    patch_players(monkeypatch, {})
-
-    async def fake_fetch(ep_url):
-        return make_ep(1, downloads=[
-            {"quality": "الجودة المتوسطة SD", "host": "gofile",
-             "url": "https://gofile.io/d/SD1"},
-        ])
-
-    result = await season.scan_season(
-        [{"number": "1", "url": "https://witanime.example/ep-1", "type": "حلقة"}],
-        max_eps=24,
-        fetch_episode=fake_fetch,
-    )
-    assert result["counts"] == {"FHD": 0, "HD": 0, "SD": 1}
-
-
-@pytest.mark.asyncio
-async def test_job_okru_download_sent(monkeypatch):
-    patch_players(monkeypatch, {})
-
-    async def fake_fetch(ep_url):
-        return make_ep(1, okru=True)
-
-    monkeypatch.setattr(
-        resolvers, "resolve_mp4", lambda url: "https://ok.example/v.mp4"
-    )
-    monkeypatch.setattr(
-        resolvers, "get_session",
-        lambda: FakeSession(FakeResp([b"v" * 64])),
-        raising=False,
-    )
-
-    bot = FakeBot()
-    job = make_job(
-        bot,
-        [{"number": "1", "url": "https://witanime.example/ep-1", "type": "حلقة"}],
-        fetch_episode=fake_fetch,
-    )
-    await job.run()
-
-    assert job.results == [("1", "sent", "HD", "", "ok.ru")]
-    assert len(bot.sent_videos) == 1
-    assert "| ok.ru" in bot.sent_videos[0]["caption"]
-
-
-# ---------------------------------------------------------------------------
-# gofile ZIP path — real zips built in-test via the zipfile module
-# ---------------------------------------------------------------------------
-
-def make_zip(path, entries):
-    with zipfile.ZipFile(path, "w") as zf:
-        for name, data in entries:
-            zf.writestr(name, data)
-    return path
-
-
-def gofile_ep(ep_url):
-    async def fake_fetch(_url):
-        return make_ep(1, downloads=[
-            {"quality": "الجودة العالية HD", "host": "gofile",
-             "url": "https://gofile.io/d/HD1"},
-        ])
-
-    return fake_fetch
-
-
-def patch_gofile(monkeypatch, zip_bytes, seen_headers=None):
-    monkeypatch.setattr(
-        resolvers,
-        "resolve_gofile",
-        lambda url: ("https://dl.gofile.example/f.zip",
-                     {"Cookie": "accountToken=t"}),
-    )
-
-    class ZipSession(FakeSession):
-        def get(self, url, **kwargs):
-            if seen_headers is not None:
-                seen_headers.update(kwargs.get("headers") or {})
-            return self._resp
-
-    monkeypatch.setattr(
-        resolvers,
-        "get_session",
-        lambda: ZipSession(FakeResp([zip_bytes], total=len(zip_bytes))),
-        raising=False,
-    )
-
-
-def gofile_temp_files():
-    return set(
-        glob.glob(os.path.join(tempfile.gettempdir(), "witanime-gofile-*"))
-    )
-
-
-@pytest.mark.asyncio
-async def test_job_gofile_zip_extracted_and_sent(monkeypatch, tmp_path):
-    patch_players(monkeypatch, {})
-    video = b"\x00\x01\x02" * 2048
-    zip_path = make_zip(tmp_path / "src.zip", [
-        ("notes.txt", b"hello"),
-        ("ep1.mp4", video),
-    ])
-    seen_headers = {}
-    patch_gofile(monkeypatch, zip_path.read_bytes(), seen_headers)
-
-    bot = FakeBot()
-    sent = {}
-    orig_send = bot.send_video
-
-    async def send_video(chat_id=None, video=None, caption=None, **kw):
-        sent["data"] = video.read()
-        return await orig_send(
-            chat_id=chat_id, video=io.BytesIO(sent["data"]), caption=caption, **kw
-        )
-
-    bot.send_video = send_video
-    leftovers_before = gofile_temp_files()
-    job = make_job(
-        bot,
-        [{"number": "1", "url": "https://witanime.example/ep-1", "type": "حلقة"}],
-        fetch_episode=gofile_ep("https://witanime.example/ep-1"),
-    )
-    await job.run()
-
-    assert job.results == [("1", "sent", "HD", "", "gofile (ZIP)")]
-    assert sent["data"] == video  # the extracted mp4 was sent, not the ZIP
-    assert len(bot.sent_videos) == 1
-    assert "gofile (ZIP)" in bot.sent_videos[0]["caption"]
-    assert seen_headers.get("Cookie") == "accountToken=t"  # gofile auth cookie
-    assert gofile_temp_files() == leftovers_before  # ZIP + extracted cleaned up
-    summary = bot.sent_messages[-1].text
-    assert "✅ 1" in summary and "gofile (ZIP)" in summary
-
-
-@pytest.mark.asyncio
-async def test_job_gofile_zip_over_limit_sends_links(monkeypatch, tmp_path):
-    patch_players(monkeypatch, {})
-    zip_path = make_zip(tmp_path / "big.zip", [("ep1.mp4", b"x" * 4096)])
-    patch_gofile(monkeypatch, zip_path.read_bytes())
-
-    too_big_calls = []
-    bot = FakeBot()
-    job = make_job(
-        bot,
-        [{"number": "1", "url": "https://witanime.example/ep-1", "type": "حلقة"}],
-        max_bytes=1024,  # the ZIP itself already exceeds the limit
-        fetch_episode=gofile_ep("https://witanime.example/ep-1"),
-        too_big_calls=too_big_calls,
-    )
-    await job.run()
-
-    assert [r[1] for r in job.results] == ["links"]
-    assert len(too_big_calls) == 1
-    assert len(bot.sent_videos) == 0
-    assert "🔗 1" in bot.sent_messages[-1].text
-
-
-@pytest.mark.asyncio
-async def test_job_gofile_zip_without_video_fails(monkeypatch, tmp_path):
-    patch_players(monkeypatch, {})
-    zip_path = make_zip(tmp_path / "novid.zip", [("notes.txt", b"hello")])
-    patch_gofile(monkeypatch, zip_path.read_bytes())
-
-    bot = FakeBot()
-    job = make_job(
-        bot,
-        [{"number": "1", "url": "https://witanime.example/ep-1", "type": "حلقة"}],
-        fetch_episode=gofile_ep("https://witanime.example/ep-1"),
-    )
-    await job.run()
-
-    assert [r[1] for r in job.results] == ["failed"]
-    assert "لا يحتوي" in job.results[0][3]
-    assert len(bot.sent_videos) == 0
-    assert "❌ 1" in bot.sent_messages[-1].text
-
-
-def test_extract_video_picks_biggest_and_handles_bad_zip(tmp_path):
-    mixed = make_zip(tmp_path / "mixed.zip", [
-        ("a.avi", b"1" * 10),
-        ("b.mp4", b"2" * 100),
-        ("c.txt", b"3" * 1000),  # bigger but not a video -> ignored
-    ])
-    out = season._extract_video(str(mixed))
-    try:
-        assert out is not None
-        with open(out, "rb") as fh:
-            assert fh.read() == b"2" * 100
-    finally:
-        if out:
-            os.unlink(out)
-
-    bad = tmp_path / "bad.zip"
-    bad.write_bytes(b"definitely not a zip")
-    assert season._extract_video(str(bad)) is None
-
-    empty = make_zip(tmp_path / "empty.zip", [("c.txt", b"3")])
-    assert season._extract_video(str(empty)) is None
-
-
-def test_status_text_includes_source_label():
-    job = make_job(FakeBot(), [])
-    job.current_src = "gofile (ZIP)"
-    text = job.build_status_text()
-    assert "gofile (ZIP)" in text
-    job2 = make_job(FakeBot(), [])
-    assert "|" not in job2.build_status_text().split("جودة", 1)[-1]
