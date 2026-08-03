@@ -522,7 +522,6 @@ async def test_job_mega_inflight_oversize_marks_links(monkeypatch):
     bot = FakeBot()
     job = make_job(bot, [
         {"number": "1", "url": "https://witanime.example/ep-1", "type": "حلقة"},
-
     ], max_bytes=1024, too_big_calls=too_big_calls)
     await job.run()
 
