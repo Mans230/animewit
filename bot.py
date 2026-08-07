@@ -1168,7 +1168,7 @@ async def _run_scan_and_show_qualities(query_obj, anime_url: str, title: str,
     )
     if not any(scan["counts"].values()):
         await query_obj.message.reply_text(
-            "😕 مفيش مصادر تحميل (Google Drive / Mega) متاحة للحلقات دي حاليًا."
+            "😕 مفيش مصادر تحميل (Google Drive / Mega / Gofile) متاحة للحلقات دي حاليًا."
         )
         return
     tok = uuid.uuid4().hex[:8]
