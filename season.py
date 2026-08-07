@@ -1,9 +1,10 @@
 """Batch season-download engine (SPEC.md §Module: season.py).
 
 Sends a whole season (or a range of episodes) into Telegram one video after
-another, using Google Drive / Mega sources only (expanded from the yonaplay
-players of each episode). Supports instant cancel, per-episode TooBig
-fallback (direct-download links instead), nearest-quality substitution and a
+another, using Google Drive / Mega sources (expanded from the yonaplay
+players of each episode) plus Gofile sources from the episode download rows.
+Supports instant cancel, per-episode TooBig fallback (direct-download links
+instead), nearest-quality substitution and a
 detailed final Arabic summary (always sent, even on cancel).
 
 This module must NOT import bot.py — the job registry lives there.
@@ -27,7 +28,11 @@ log = logging.getLogger(__name__)
 
 # yonaplay players expose HD/FHD only — order = best → worst
 QUALITIES = ["FHD", "HD"]
-PREFER_HOST = {"drive": 0, "mega": 1}
+PREFER_HOST = {"drive": 0, "mega": 1, "gofile": 2}
+
+# Map the episode page's Arabic download-row quality labels onto QUALITIES
+# («الجودة المتوسطة SD» rows are ignored — batch sends HD/FHD only).
+_DOWNLOAD_QUALITY_MAP = (("الخارقة", "FHD"), ("العالية", "HD"))
 
 _CACHE_TTL = 6 * 3600          # 6h resolve cache
 _CACHE_MAX = 500               # max cached episodes
@@ -72,13 +77,26 @@ def _src_kind(url: str, host: str) -> str | None:
         return "drive"
     if "mega.nz" in low or "mega" in low:
         return "mega"
+    if "gofile.io" in low or "gofile" in low:
+        return "gofile"
+    return None
+
+
+def _download_row_quality(label: str) -> str | None:
+    """Arabic download-row quality label -> 'FHD'|'HD'|None (SD skipped)."""
+    for needle, quality in _DOWNLOAD_QUALITY_MAP:
+        if needle in label:
+            return quality
     return None
 
 
 async def episode_quality_sources(ep: dict) -> dict[str, list[dict]]:
-    """-> {"FHD": [{"kind": "drive"|"mega", "url": str, "host": str}], "HD": [...]}
+    """-> {"FHD": [{"kind": "drive"|"mega"|"gofile", "url": str, "host": str}], "HD": [...]}
 
-    Drive + Mega ONLY (4shared/dotplay/ok.ru excluded from batch), deduped,
+    Drive + Mega (from yonaplay players) + Gofile (from the episode's own
+    download rows — many newer episodes carry no drive/mega in yonaplay at
+    all, only soraplay, while their download rows still offer gofile).
+    4shared/dotplay/ok.ru/workupload/wahmi are excluded from batch. Deduped,
     host-sorted (drive first). Expands ALL yonaplay servers of the episode
     via scraper.get_yonaplay_players (in a thread). Results are cached in a
     6h TTL OrderedDict cache (max 500 entries).
@@ -120,6 +138,20 @@ async def episode_quality_sources(ep: dict) -> dict[str, list[dict]]:
             sources[quality].append(
                 {"kind": kind, "url": url, "host": player.get("host") or ""}
             )
+    # Fallback: gofile rows from the episode's download section (already
+    # decoded by scraper.get_episode). Accepted for batch: gofile only.
+    for row in ep.get("downloads") or []:
+        quality = _download_row_quality(row.get("quality") or "")
+        if not quality:
+            continue
+        url = row.get("url") or ""
+        kind = _src_kind(url, row.get("host") or "")
+        if kind != "gofile" or (quality, url) in seen:
+            continue
+        seen.add((quality, url))
+        sources[quality].append(
+            {"kind": kind, "url": url, "host": row.get("host") or ""}
+        )
     for quality in sources:
         sources[quality].sort(key=lambda s: PREFER_HOST.get(s["kind"], 9))
 
@@ -269,10 +301,15 @@ class SeasonJob:
     async def _download_one(self, src: dict, path: str, state: dict) -> int:
         """Download one source into `path`. Returns bytes written.
         Drive → resolve_drive_mp4 then stream via resolvers.get_session()
-        (4MB chunks); Mega → resolvers.download_mega(..., cancel=...).
-        Checks self.cancel_event per chunk → DownloadCancelled; enforces
-        max_video_bytes → TooBig."""
-        if src["kind"] == "mega":
+        (4MB chunks); Mega/Gofile → resolvers.download_mega/download_gofile
+        (..., cancel=...). Checks self.cancel_event per chunk →
+        DownloadCancelled; enforces max_video_bytes → TooBig."""
+        if src["kind"] in ("mega", "gofile"):
+            downloader = (
+                resolvers.download_mega
+                if src["kind"] == "mega"
+                else resolvers.download_gofile
+            )
             # In-flight size guard: get_mega_size may return None, so enforce
             # max_video_bytes while the file grows instead of downloading a
             # multi-GB file only to throw it away.
@@ -291,7 +328,7 @@ class SeasonJob:
 
             try:
                 return await asyncio.to_thread(
-                    resolvers.download_mega, src["url"], path, state,
+                    downloader, src["url"], path, state,
                     cancel=_cancel,
                 )
             except _DownloadCancelled:
@@ -356,9 +393,14 @@ class SeasonJob:
             quality, src = picked
             self.current_quality = quality
 
-            if src["kind"] == "mega":
+            if src["kind"] in ("mega", "gofile"):
                 # cheap remote size guard before starting the real download
-                size = await asyncio.to_thread(resolvers.get_mega_size, src["url"])
+                get_size = (
+                    resolvers.get_mega_size
+                    if src["kind"] == "mega"
+                    else resolvers.get_gofile_size
+                )
+                size = await asyncio.to_thread(get_size, src["url"])
                 if size and size > self.max_video_bytes:
                     await self.too_big_reply(full, size)
                     self.results.append(
