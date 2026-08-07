@@ -6,9 +6,13 @@ Supported:
   quality mp4 from the videos list.
 - Google Drive: turn a `/file/d/{ID}/preview` link into the direct download
   stream at drive.usercontent.google.com and verify it serves video bytes.
+- Gofile: create/cache a guest account token, list the /d/{contentId} folder
+  via api.gofile.io (signed X-Website-Token like the web app), pick the
+  largest video file and stream it with the accountToken cookie.
 """
 
 import base64
+import hashlib
 import html as html_module
 import json
 import logging
@@ -530,6 +534,230 @@ def download_mega(
                 if cancel is not None and cancel():
                     raise DownloadCancelled("mega download cancelled")
                 f.write(aes.decrypt(chunk))
+                written += len(chunk)
+                if state is not None:
+                    state["done"] = written
+    return written
+
+
+# ---------------------------------------------------------------------------
+# Gofile — guest-account resolver for https://gofile.io/d/{contentId} links.
+#
+# Flow (mirrors the gofile.io web app, verified live Aug 2026):
+# 1. POST {API}/accounts (empty body) -> guest account with a bearer token.
+# 2. GET {API}/contents/{contentId}?wt={_GOFILE_WT_PARAM}&cache=true with
+#    Authorization: Bearer <token> and a signed X-Website-Token header. The
+#    signature algorithm lives in the site's wt.obf.js (`generateWT`):
+#    sha256(f"{userAgent}::{language}::{token}::{floor(now/14400)}::{SECRET}")
+#    where userAgent/language must match the User-Agent/X-BL headers and the
+#    time bucket is 4h wide (server clock skew is tolerated via bucket-1).
+# 3. The largest video child (mp4/mkv/...) exposes a direct `link`; the CDN
+#    requires Cookie: accountToken=<token> on the download request.
+#
+# The WT secret and the `wt` query param are extracted from the site's
+# config.js / wt.obf.js; if gofile rotates them, re-extract with:
+#   node: eval(wt.obf.js source); a0_0x5c42(0x1f6,'D9ny') -> secret
+# Any API/resolve failure returns None (best-effort) instead of breaking the
+# batch download.
+# ---------------------------------------------------------------------------
+_GOFILE_API = "https://api.gofile.io"
+_GOFILE_WT_PARAM = "4fd6sg89d7s6"      # appdata.wt (config.js)
+_GOFILE_WT_SECRET = "9844d94d963d30"   # decoded from wt.obf.js generateWT
+_GOFILE_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+_GOFILE_BL = "en-US"                   # navigator.language sent as X-BL
+_GOFILE_WT_BUCKET = 4 * 3600           # 0x3840 in generateWT
+_GOFILE_TOKEN_TTL = 12 * 3600          # guest tokens are long-lived
+
+_GOFILE_VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v")
+
+_GOFILE_TOKEN: "tuple[str, float] | None" = None
+_GOFILE_TOKEN_LOCK = threading.Lock()
+
+
+def _gofile_content_id(url: str) -> "str | None":
+    m = re.search(r"gofile\.io/d/([A-Za-z0-9]+)", url or "")
+    return m.group(1) if m else None
+
+
+def _gofile_wt(token: str, bucket: "int | None" = None) -> str:
+    """Reimplementation of the site's generateWT (wt.obf.js)."""
+    if bucket is None:
+        bucket = int(time.time() // _GOFILE_WT_BUCKET)
+    payload = f"{_GOFILE_UA}::{_GOFILE_BL}::{token}::{bucket}::{_GOFILE_WT_SECRET}"
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _gofile_headers(token: str, wt: str) -> dict:
+    return {
+        "User-Agent": _GOFILE_UA,
+        "Accept": "*/*",
+        "Origin": "https://gofile.io",
+        "Referer": "https://gofile.io/",
+        "Authorization": f"Bearer {token}",
+        "X-Website-Token": wt,
+        "X-BL": _GOFILE_BL,
+    }
+
+
+def _gofile_account_token() -> str:
+    """Create (or reuse) a cached guest-account token."""
+    global _GOFILE_TOKEN
+    with _GOFILE_TOKEN_LOCK:
+        if (
+            _GOFILE_TOKEN is not None
+            and time.time() - _GOFILE_TOKEN[1] < _GOFILE_TOKEN_TTL
+        ):
+            return _GOFILE_TOKEN[0]
+        r = requests.post(
+            f"{_GOFILE_API}/accounts",
+            headers={"User-Agent": _GOFILE_UA},
+            json={},
+            timeout=TIMEOUT,
+        )
+        r.raise_for_status()
+        body = r.json()
+        if body.get("status") != "ok":
+            raise RuntimeError(f"gofile: account creation failed: {body.get('status')}")
+        token = body["data"]["token"]
+        _GOFILE_TOKEN = (token, time.time())
+        return token
+
+
+def _gofile_children(data: dict) -> list[dict]:
+    """children is a dict keyed by content id (older API returned a list)."""
+    children = data.get("children") or {}
+    if isinstance(children, dict):
+        return list(children.values())
+    return list(children)
+
+
+def _pick_gofile_video(children: list[dict]) -> "dict | None":
+    """Largest downloadable video file among the folder children."""
+    videos = [
+        c
+        for c in children
+        if c.get("type") == "file"
+        and c.get("link")
+        and (c.get("name") or "").lower().endswith(_GOFILE_VIDEO_EXTS)
+    ]
+    if not videos:
+        return None
+    return max(videos, key=lambda c: int(c.get("size") or 0))
+
+
+def resolve_gofile(url: str) -> "dict | None":
+    """Cached wrapper around the gofile resolver (6h TTL; None cached 10 min).
+
+    -> {"url": direct link, "size": int, "token": guest account token}
+    The caller must send Cookie: accountToken=<token> when downloading.
+    """
+    cached, hit = _cache_get(url)
+    if hit:
+        return cached
+    result = _resolve_gofile_uncached(url)
+    _cache_put(url, result)
+    return result
+
+
+def _resolve_gofile_uncached(url: str) -> "dict | None":
+    """Resolve a gofile /d/ link to its largest video file. None on failure."""
+    global _GOFILE_TOKEN
+    content_id = _gofile_content_id(url)
+    if not content_id:
+        return None
+    try:
+        token = _gofile_account_token()
+    except Exception as exc:  # noqa: BLE001 — rate limit / network
+        log.warning("gofile account token failed: %s", exc)
+        return None
+
+    bucket = int(time.time() // _GOFILE_WT_BUCKET)
+    for attempt, b in enumerate((bucket, bucket - 1)):
+        try:
+            r = requests.get(
+                f"{_GOFILE_API}/contents/{content_id}",
+                params={"wt": _GOFILE_WT_PARAM, "cache": "true"},
+                headers=_gofile_headers(token, _gofile_wt(token, b)),
+                timeout=TIMEOUT,
+            )
+            body = r.json()
+        except Exception as exc:  # noqa: BLE001 — network/JSON
+            log.warning("gofile contents fetch failed (%s): %s", url, exc)
+            return None
+        status = body.get("status")
+        if status == "ok":
+            video = _pick_gofile_video(_gofile_children(body.get("data") or {}))
+            if not video:
+                log.warning("gofile: no video file in %s", url)
+                return None
+            return {
+                "url": video["link"],
+                "size": int(video.get("size") or 0),
+                "token": token,
+            }
+        if status == "error-notPremium" and attempt == 0:
+            continue  # maybe a 4h bucket boundary skew — retry with bucket-1
+        if status == "error-rateLimit":
+            # drop the cached guest token so the next resolve creates a
+            # fresh account instead of reusing the (possibly banned) one
+            with _GOFILE_TOKEN_LOCK:
+                _GOFILE_TOKEN = None
+        # error-notFound / error-rateLimit / password-protected etc.
+        log.warning("gofile contents %s -> %s", url, status)
+        return None
+    log.warning("gofile contents %s -> error-notPremium (WT rejected)", url)
+    return None
+
+
+def get_gofile_size(url: str) -> "int | None":
+    """Best-effort remote size lookup for a gofile video (bytes)."""
+    try:
+        info = resolve_gofile(url)
+        if not info:
+            return None
+        return info["size"] or None
+    except Exception as exc:  # noqa: BLE001 — size is best-effort only
+        log.warning("gofile size lookup failed: %s", exc)
+        return None
+
+
+def download_gofile(
+    url: str,
+    path: str,
+    state: "dict | None" = None,
+    cancel=None,
+) -> int:
+    """Blocking download of a gofile video to `path` (same contract as
+    download_mega): `state["done"]`/`state["total"]` track progress, `cancel`
+    is checked before every chunk and raises DownloadCancelled when truthy.
+    Returns bytes written; raises on any failure."""
+    info = resolve_gofile(url)
+    if not info:
+        raise RuntimeError("gofile: cannot resolve direct link")
+    if state is not None:
+        state["total"] = info["size"]
+    headers = {
+        "User-Agent": _GOFILE_UA,
+        "Cookie": f"accountToken={info['token']}",
+    }
+    if cancel is not None and cancel():
+        raise DownloadCancelled("gofile download cancelled")
+    written = 0
+    with get_session().get(info["url"], stream=True, timeout=60, headers=headers) as r:
+        r.raise_for_status()
+        if state is not None and not state.get("total"):
+            try:
+                state["total"] = int(r.headers.get("Content-Length") or 0)
+            except (TypeError, ValueError):
+                pass
+        with open(path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 2048):
+                if cancel is not None and cancel():
+                    raise DownloadCancelled("gofile download cancelled")
+                f.write(chunk)
                 written += len(chunk)
                 if state is not None:
                     state["done"] = written
