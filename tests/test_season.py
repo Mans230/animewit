@@ -554,3 +554,164 @@ def test_status_markup_cancel_button():
     assert btn.text == "❌ إلغاء التحميل"
     assert btn.callback_data == "sdc|42"
     assert len(btn.callback_data.encode()) <= 64
+
+
+# ---------------------------------------------------------------------------
+# gofile sources (episode download rows) + gofile downloads
+# ---------------------------------------------------------------------------
+
+def gofile_row(quality="الجودة الخارقة FHD", cid="GF1"):
+    return {
+        "quality": quality,
+        "host": "gofile",
+        "url": f"https://gofile.io/d/{cid}",
+    }
+
+
+@pytest.mark.asyncio
+async def test_episode_quality_sources_gofile_from_download_rows(monkeypatch):
+    # yonaplay carries nothing usable (soraplay-only episode) but the
+    # episode's own download rows offer gofile -> accepted for batch
+    patch_players(monkeypatch, {
+        "https://yona.example/embed/1": [
+            {"host": "soraplay.xyz", "quality": "FHD",
+             "url": "https://soraplay.xyz/embed/xyz"},
+        ],
+    })
+    ep = make_ep(1)
+    ep["downloads"] = [
+        gofile_row("الجودة المتوسطة SD", "SD1"),          # ignored (SD)
+        gofile_row("الجودة العالية HD", "HD1"),
+        gofile_row("الجودة الخارقة FHD", "FHD1"),
+        {"quality": "الجودة الخارقة FHD", "host": "workupload",
+         "url": "https://workupload.com/file/xyz"},        # excluded host
+    ]
+    sources = await season.episode_quality_sources(ep)
+    assert [s["kind"] for s in sources["FHD"]] == ["gofile"]
+    assert sources["FHD"][0]["url"] == "https://gofile.io/d/FHD1"
+    assert [s["kind"] for s in sources["HD"]] == ["gofile"]
+    assert all("SD1" not in s["url"] for srcs in sources.values() for s in srcs)
+
+
+@pytest.mark.asyncio
+async def test_episode_quality_sources_gofile_dedup_and_order(monkeypatch):
+    embed = "https://yona.example/embed/1"
+    patch_players(monkeypatch, {
+        embed: [mega_src("FHD"), drive_src("FHD")],
+    })
+    ep = make_ep(1, embed)
+    ep["downloads"] = [
+        gofile_row("الجودة الخارقة FHD", "FHD1"),
+        gofile_row("الجودة الخارقة FHD", "FHD1"),  # duplicate row -> deduped
+    ]
+    sources = await season.episode_quality_sources(ep)
+    assert [s["kind"] for s in sources["FHD"]] == ["drive", "mega", "gofile"]
+
+
+@pytest.mark.asyncio
+async def test_scan_season_counts_gofile(monkeypatch):
+    patch_players(monkeypatch, {"https://yona.example/embed/1": []})
+
+    async def fake_fetch(ep_url):
+        ep = make_ep(1)
+        ep["downloads"] = [gofile_row("الجودة الخارقة FHD")]
+        return ep
+
+    result = await season.scan_season(
+        [{"number": "1", "url": "https://witanime.example/ep-1", "type": "حلقة"}],
+        max_eps=24,
+        fetch_episode=fake_fetch,
+    )
+    assert result["counts"] == {"FHD": 1, "HD": 0}
+    assert result["eps"][0]["sources"]["FHD"][0]["kind"] == "gofile"
+
+
+@pytest.mark.asyncio
+async def test_job_gofile_download_sends_video(monkeypatch):
+    patch_players(monkeypatch, {"https://yona.example/embed/1": []})
+    monkeypatch.setattr(resolvers, "get_gofile_size", lambda url: 64)
+
+    def fake_download_gofile(url, path, state, cancel=None):
+        state["total"] = 64
+        with open(path, "wb") as fh:
+            fh.write(b"g" * 64)
+            state["done"] = 64
+        return 64
+
+    monkeypatch.setattr(resolvers, "download_gofile", fake_download_gofile)
+
+    async def fake_fetch(ep_url):
+        ep = make_ep(1)
+        ep["downloads"] = [gofile_row("الجودة الخارقة FHD")]
+        return ep
+
+    bot = FakeBot()
+    job = make_job(bot, [
+        {"number": "1", "url": "https://witanime.example/ep-1", "type": "حلقة"},
+    ], fetch_episode=fake_fetch)
+    await job.run()
+
+    assert [r[1] for r in job.results] == ["sent"]
+    assert job.results[0][2] == "FHD"
+    assert len(bot.sent_videos) == 1
+    assert "✅ 1" in bot.sent_messages[-1].text
+
+
+@pytest.mark.asyncio
+async def test_job_gofile_size_guard_sends_links(monkeypatch):
+    patch_players(monkeypatch, {"https://yona.example/embed/1": []})
+    monkeypatch.setattr(resolvers, "get_gofile_size", lambda url: 999_999_999)
+
+    def forbidden_download(*a, **kw):  # guard must fire before any download
+        raise AssertionError("download_gofile should not be called")
+
+    monkeypatch.setattr(resolvers, "download_gofile", forbidden_download)
+
+    async def fake_fetch(ep_url):
+        ep = make_ep(1)
+        ep["downloads"] = [gofile_row("الجودة الخارقة FHD")]
+        return ep
+
+    too_big_calls = []
+    bot = FakeBot()
+    job = make_job(bot, [
+        {"number": "1", "url": "https://witanime.example/ep-1", "type": "حلقة"},
+    ], max_bytes=1024, fetch_episode=fake_fetch, too_big_calls=too_big_calls)
+    await job.run()
+
+    assert [r[1] for r in job.results] == ["links"]
+    assert len(too_big_calls) == 1
+    assert too_big_calls[0][1] == 999_999_999
+    assert "🔗 1" in bot.sent_messages[-1].text
+
+
+@pytest.mark.asyncio
+async def test_job_gofile_inflight_oversize_marks_links(monkeypatch):
+    patch_players(monkeypatch, {"https://yona.example/embed/1": []})
+    monkeypatch.setattr(resolvers, "get_gofile_size", lambda url: None)
+
+    def fake_download_gofile(url, path, state, cancel=None):
+        with open(path, "wb") as fh:
+            while True:
+                if cancel and cancel():
+                    raise resolvers.DownloadCancelled()
+                fh.write(b"x" * 512)
+                fh.flush()
+
+    monkeypatch.setattr(resolvers, "download_gofile", fake_download_gofile)
+
+    async def fake_fetch(ep_url):
+        ep = make_ep(1)
+        ep["downloads"] = [gofile_row("الجودة الخارقة FHD")]
+        return ep
+
+    too_big_calls = []
+    bot = FakeBot()
+    job = make_job(bot, [
+        {"number": "1", "url": "https://witanime.example/ep-1", "type": "حلقة"},
+    ], max_bytes=1024, fetch_episode=fake_fetch, too_big_calls=too_big_calls)
+    await job.run()
+
+    assert [r[1] for r in job.results] == ["links"]  # TooBig, not cancelled
+    assert len(too_big_calls) == 1
+    assert too_big_calls[0][1] > 1024
