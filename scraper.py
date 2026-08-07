@@ -15,7 +15,9 @@ log = logging.getLogger(__name__)
 
 BASE = "https://witanime.life"
 
-YONAPLAY_API_KEY = "23a97133-caf3-4eb4-9466-93d0a4ff8198"
+# Live key extracted from the site's own player loader (yh00.js). The old
+# key (23a97133-...) died in early Aug 2026 — embeds return 404 without it.
+YONAPLAY_API_KEY = "9933bd27-92ea-4ee9-807d-e612029d6318"
 
 HEADERS = {
     "User-Agent": (
@@ -127,23 +129,34 @@ def get_anime_info(anime_url: str) -> dict:
 
 
 def _decode_watch_servers(html: str) -> list[str]:
-    """Decode watch server embed URLs from `var _zH` / `var _zW` (SPEC §5.2)."""
-    m_res = re.search(r'var _zH\s*=\s*"([^"]+)"', html)
-    m_cfg = re.search(r'var _zW\s*=\s*"([^"]+)"', html)
+    """Decode watch server embed URLs (SPEC §5.2).
+
+    The site renamed its obfuscation vars in Aug 2026: `_zT`/`_zV` are the
+    current pair; `_zH`/`_zW` are kept as a fallback for older cached pages.
+    Decode algorithm (reverse → strip junk → atob → cut trailing offset from
+    cfg.d[atob(cfg.k)]) is unchanged — verified live against yh00.js.
+    """
+    m_res = re.search(r'var _zT\s*=\s*"([^"]+)"', html) or re.search(
+        r'var _zH\s*=\s*"([^"]+)"', html
+    )
+    m_cfg = re.search(r'var _zV\s*=\s*"([^"]+)"', html) or re.search(
+        r'var _zW\s*=\s*"([^"]+)"', html
+    )
     if not (m_res and m_cfg):
         return []
     try:
         res = json.loads(base64.b64decode(m_res.group(1)))
         cfg = json.loads(base64.b64decode(m_cfg.group(1)))
     except Exception as exc:
-        log.warning("_zH/_zW parse failed: %s", exc)
+        log.warning("_zT/_zV parse failed: %s", exc)
         return []
 
     def decode_server(i: int) -> str:
         d = re.sub(r"[^A-Za-z0-9+/=]", "", res[i][::-1])
         c = cfg[i]
         off = c["d"][int(base64.b64decode(c["k"]))]
-        return base64.b64decode(d)[:-off].decode()
+        # .strip(): some entries decode with stray leading whitespace
+        return base64.b64decode(d)[:-off].decode().strip()
 
     urls = []
     for i in range(len(res)):
@@ -156,7 +169,11 @@ def _decode_watch_servers(html: str) -> list[str]:
 
 
 def _decode_download_urls(html: str) -> list[str]:
-    """Decode download URLs from `_m`, `_t`, `_s`, `_p0.._p{n-1}` (SPEC §5.3).
+    """Decode download URLs from `_m`, `_p0.._p{n-1}` + ordering vars (SPEC §5.3).
+
+    Aug 2026 site update: the count moved from `_t.l` to `_b.l` and the
+    per-link ordering array from `_s` to `_x` (decoder now lives in cx2.js;
+    XOR-hex against atob(_m.r) is unchanged). Old `_t`/`_s` kept as fallback.
 
     Order of decoded URLs (index 0..count-1) matches the order of
     `a.download-link[data-index]` buttons in the page.
@@ -165,8 +182,14 @@ def _decode_download_urls(html: str) -> list[str]:
         secret = base64.b64decode(
             json.loads(re.search(r"var _m = (\{.*?\});", html).group(1))["r"]
         ).decode()
-        count = int(json.loads(re.search(r"var _t = (\{.*?\});", html).group(1))["l"])
-        sarr = json.loads(re.search(r"var _s = (\[.*?\]);", html).group(1))
+        m_b = re.search(r"var _b = (\{.*?\});", html)
+        m_x = re.search(r"var _x = (\[.*?\]);", html)
+        if m_b and m_x:  # current scheme
+            count = int(json.loads(m_b.group(1))["l"])
+            sarr = json.loads(m_x.group(1))
+        else:  # legacy scheme
+            count = int(json.loads(re.search(r"var _t = (\{.*?\});", html).group(1))["l"])
+            sarr = json.loads(re.search(r"var _s = (\[.*?\]);", html).group(1))
     except (AttributeError, ValueError, KeyError) as exc:
         log.warning("download vars parse failed: %s", exc)
         return []
@@ -309,7 +332,12 @@ def get_episode(ep_url: str) -> dict:
         if not embed.startswith(("http://", "https://")):
             log.warning("skipping server %r — empty/invalid embed after decode", name)
             continue  # prevents broken /watch?u= (Bad Request) buttons
-        if "yonaplay" in name.lower():
+        # The site's loader keys the apiKey off the embed URL pattern
+        # (yonaplay.net/embed.php?id=N) — match on URL and on the name so a
+        # server label change can't silently drop the key (404 without it).
+        if "yonaplay" in name.lower() or re.match(
+            r"^https://yonaplay\.net/embed\.php\?id=\d+$", embed
+        ):
             embed += "&apiKey=" + YONAPLAY_API_KEY
         servers.append({"name": name, "embed_url": embed})
 
